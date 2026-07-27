@@ -25,7 +25,7 @@ Demand is established upstream and unmet: [nestjs/graphql#1587](https://github.c
 - Produce **byte-identical** output to the boot path, so drift detection has no false positives.
 - Discover resolvers automatically — never hand-enumerated.
 - Support Nest monorepo projects and multiple schemas per application.
-- Fail CI with a non-zero exit code when the committed schema is stale.
+- Give CI a reliable way to fail when the committed schema is stale.
 
 ## Non-goals (v1)
 
@@ -87,7 +87,8 @@ The feature set must therefore ride on existing flags:
 |---|---|---|
 | Named schema selection | `[name]` positional | Supported |
 | Monorepo project selection | `--project <name>` | Supported |
-| CI drift check | `--dry-run` | Supported |
+| Human-facing preview | `--dry-run` | Supported (always exits 0) |
+| CI drift check | `git diff --exit-code` | Supported, out of band |
 | Watch mode | — | Not available |
 
 Resulting surface:
@@ -99,18 +100,22 @@ nest g -c @scope/nest-graphql regenerate --project api   # monorepo project
 nest g -c @scope/nest-graphql regenerate --dry-run       # CI check; exit 1 on drift
 ```
 
-`--dry-run` is a natural fit rather than a workaround: the schematic writes through the schematics `Tree`, so dry-run reports `UPDATE src/schema.gql` without committing. The schematic additionally throws `SchematicsException` on drift to force a non-zero exit.
+`--dry-run` works as a human-facing preview: the schematic writes through the schematics `Tree`, so dry-run reports `UPDATE src/schema.gql` without committing.
 
-Recommended `package.json` aliases:
+**`nest g` cannot propagate failure.** `AbstractRunner.run()` calls bare `reject()` with no argument on a non-zero child exit, and `generate.action.ts` catches it behind `if (error && error.message)` — which is false for `undefined`. Nothing rethrows, so `nest g` exits 0 even when the schematic throws a `SchematicsException`. The user sees a red error; CI sees success.
+
+Drift detection therefore runs **out of band**, using the tool every repository already has:
 
 ```json
 {
   "scripts": {
     "gql:gen": "nest g -c @scope/nest-graphql regenerate",
-    "gql:check": "nest g -c @scope/nest-graphql regenerate --dry-run"
+    "gql:check": "pnpm gql:gen && git diff --exit-code -- '*.gql'"
   }
 }
 ```
+
+This is idiomatic for codegen, requires no code from us, and produces a readable diff on failure. A companion `bin` sharing the same emitter core is the fallback if non-git drift detection is ever needed (see Follow-ups).
 
 ## Architecture
 
@@ -145,14 +150,16 @@ const ctx = await NestFactory.createApplicationContext(AppModule, {
   preview: true, abortOnError: false, logger: false,
 });
 
-// 2. Harvest metatypes
+// 2. Harvest metatypes, honouring `include` exactly as ResolversExplorerService does
 const resolvers = [], scalars = [];
-for (const mod of ctx.get(ModulesContainer).values())
+for (const mod of ctx.get(ModulesContainer).values()) {
+  if (include?.length && !include.includes(mod.metatype)) continue;
   for (const w of mod.providers.values()) {
     const t = w.metatype; if (!t) continue;
     if (Reflect.getMetadata(RESOLVER_TYPE_METADATA, t)) resolvers.push(t);
     if (Reflect.getMetadata(SCALAR_NAME_METADATA, t)) scalars.push(t);
   }
+}
 
 // 3. Build via the same factory the boot path uses
 const schemaCtx = await NestFactory.createApplicationContext(
@@ -216,13 +223,9 @@ The `[name]` positional selects the key: `nest g -c @scope/nest-graphql regenera
 
 ## Drift check semantics
 
-Under `--dry-run`:
+The schematic always regenerates and writes through the `Tree`. It logs whether content changed, so `--dry-run` gives humans a useful preview. It does **not** attempt to signal failure via exit code — see "Flag budget" for why that is impossible through `nest g`.
 
-1. Generate SDL in memory.
-2. Read the existing file from the `Tree`.
-3. Byte-compare.
-4. Identical → log "up to date", exit 0.
-5. Different, or file absent → print a unified diff and throw `SchematicsException`, forcing a non-zero exit.
+CI asserts freshness with `git diff --exit-code` after regenerating.
 
 ## Failure modes
 
@@ -231,15 +234,17 @@ Under `--dry-run`:
 3. **Stale `dist/`.** Addressed by (2) — the build always runs. A config-level opt-out for speed is a follow-up.
 4. **Schema option injection.** `generate.command.ts` unconditionally pushes `spec`, `flat`, `specFileSuffix`, `skipImport`, `type`, `crud`, and `collection` into the schematic invocation, and `generate.action.ts` appends `language`. The schematic's `schema.json` must accept all of them; `"additionalProperties": false` will cause a validation failure.
 5. **Version skew.** Addressed by U2's project-root module resolution.
+6. **Swallowed exit codes.** `nest g` reports schematic failures to stderr but always exits 0. Any failure mode that CI must catch has to be observable in the filesystem, not the exit code. This constrains the drift-check design and is the reason for the `git diff` approach.
+7. **CommonJS requirement.** `NodeModulesEngineHost` loads schematic factories with `require()`. The published package must be CJS; `"type": "module"` in `package.json` breaks collection loading.
 
 ## Testing
 
 | Level | Coverage |
 |---|---|
 | Byte-parity (critical) | Fixture app booted normally with `autoSchemaFile`, versus U2's output. Must match byte-for-byte. Guards every drift-check claim. |
-| Discovery | Fixture with resolvers behind a dynamic module, a conditional import, and an `include` filter. Assert the harvested set matches `ResolversExplorerService`. |
+| Discovery | Unit tests over the container walk, including `include` filtering, plus a metadata-key test pinning the hardcoded keys against `@nestjs/graphql`'s actual values. Dynamic modules and conditional imports need no dedicated fixture — the real container is consumed as-is rather than reimplemented. |
 | Side-effect isolation | Fixture whose provider constructor throws and whose `onModuleInit` connects to a nonexistent host. Must still emit. |
-| Drift check | Assert exit 0 when in sync, exit 1 plus diff when stale or absent. |
+| Drift reporting | Assert the schematic logs "up to date" when in sync and reports an update when stale; assert `--dry-run` leaves the file untouched. |
 | Monorepo / multi-schema | Two-project `nest-cli.json`, two named schemas; assert correct file targets. |
 
 The byte-parity suite is the project's spine. Everything else is downstream of it.
@@ -275,6 +280,7 @@ src/
 
 1. Apollo Federation subgraph emission (`buildSubgraphSchema` path).
 2. Watch mode as a `chokidar` wrapper script, documented in the README.
-3. Env stubbing for fixtures whose module-level evaluation requires configuration.
-4. ts-morph static-analysis fallback, if preview boot proves insufficient.
-5. Upstream contribution: generic external-command resolution in `@nestjs/cli` (`nest <cmd>` → `nest-<cmd>`), which would unlock first-class `nest graphql regenerate` and benefit the whole ecosystem.
+3. Companion `bin` sharing the emitter core, for drift detection in non-git contexts where `git diff --exit-code` is unavailable.
+4. Env stubbing for fixtures whose module-level evaluation requires configuration.
+5. ts-morph static-analysis fallback, if preview boot proves insufficient.
+6. Upstream contribution: two changes to `@nestjs/cli` worth proposing — propagating schematic exit codes out of `generate.action.ts`, and generic external-command resolution (`nest <cmd>` → `nest-<cmd>`) that would unlock first-class `nest graphql regenerate`.

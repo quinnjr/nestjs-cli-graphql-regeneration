@@ -1,0 +1,1631 @@
+# `nest g regenerate` Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Ship an installable schematics collection that regenerates a NestJS code-first GraphQL schema to disk without booting the application.
+
+**Architecture:** A schematics collection extending `@nestjs/schematics` exposes a `regenerate` schematic. The schematic resolves the target project from `nest-cli.json`, runs `nest build`, then forks a child process that preview-boots the user's `AppModule` (no provider instantiation), harvests resolver and scalar metatypes off the DI container, and builds SDL via `GraphQLSchemaFactory`. The SDL comes back over stdout and is written through the schematics `Tree`.
+
+**Tech Stack:** TypeScript (CommonJS output), `@angular-devkit/schematics`, `@nestjs/schematics` (peer), `@nestjs/graphql` (peer), Jest + ts-jest.
+
+## Global Constraints
+
+- **The published package MUST be CommonJS.** `NodeModulesEngineHost` loads schematic factories with `require()`. `"type": "module"` in `package.json` breaks collection loading. The existing `package.json` currently has `"type": "module"` — Task 1 removes it.
+- **Never load the user's TypeScript directly.** `@nestjs/graphql/plugin` is a TS *transformer*; `ts-node`/`tsx`/`jiti` do not apply it, and bare `@Field()` decorators silently produce a different schema. Always `nest build` first and load `dist/`.
+- **Resolve the user's Nest packages from the user's project**, via `require.resolve(id, { paths: [projectRoot] })`. Never from this package's own `node_modules`.
+- **`nest g` always exits 0.** `AbstractRunner.run()` calls bare `reject()` and `generate.action.ts` swallows it behind `if (error && error.message)`. Do not design any behaviour that depends on a non-zero exit code from `nest g`.
+- **`schema.json` MUST NOT set `"additionalProperties": false`.** `nest g` unconditionally injects `name`, `path`, `collection`, `project`, `skipImport`, `type`, `crud`, `language`, `sourceRoot`, `spec`, `flat`, `specFileSuffix`.
+- Package name placeholder throughout: `@scope/nest-graphql`. Substitute the real name once chosen; it affects no logic.
+- Byte-parity between generated SDL and the boot path's `autoSchemaFile` output is the project's core correctness guarantee. Task 5 establishes it; no later task may regress it.
+
+---
+
+### Task 1: Package scaffolding, CJS build, Jest
+
+Establishes the toolchain. Nothing else can be tested until `pnpm build` and `pnpm test` work.
+
+**Files:**
+- Modify: `package.json`
+- Create: `tsconfig.json`
+- Create: `jest.config.js`
+- Create: `src/version.ts`
+- Test: `test/version.spec.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces: `pnpm build` compiles `src/**/*.ts` → `dist/` as CommonJS. `pnpm test` runs Jest over `test/**/*.spec.ts`.
+
+- [ ] **Step 1: Replace `package.json`**
+
+The critical change is deleting `"type": "module"` — see Global Constraints.
+
+```json
+{
+  "name": "@scope/nest-graphql",
+  "version": "0.1.0",
+  "description": "Regenerate a NestJS code-first GraphQL schema without booting the app",
+  "license": "MIT",
+  "schematics": "./dist/collection.json",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && pnpm copy:meta",
+    "copy:meta": "node -e \"const{cpSync,existsSync,mkdirSync}=require('fs');for(const[s,d]of[['src/collection.json','dist/collection.json'],['src/regenerate/schema.json','dist/regenerate/schema.json']]){if(!existsSync(s))continue;mkdirSync(require('path').dirname(d),{recursive:true});cpSync(s,d)}\"",
+    "test": "jest",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@angular-devkit/core": "^17.0.0",
+    "@angular-devkit/schematics": "^17.0.0"
+  },
+  "peerDependencies": {
+    "@nestjs/common": ">=10",
+    "@nestjs/core": ">=10",
+    "@nestjs/graphql": ">=12",
+    "@nestjs/schematics": ">=10"
+  },
+  "devDependencies": {
+    "@nestjs/common": "^10.4.0",
+    "@nestjs/core": "^10.4.0",
+    "@nestjs/graphql": "^12.2.0",
+    "@nestjs/apollo": "^12.2.0",
+    "@nestjs/platform-express": "^10.4.0",
+    "@nestjs/schematics": "^10.2.0",
+    "@apollo/server": "^4.11.0",
+    "graphql": "^16.9.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "@types/jest": "^29.5.13",
+    "@types/node": "^20.16.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.5.4"
+  },
+  "devEngines": {
+    "packageManager": { "name": "pnpm", "version": "^11.13.0", "onFail": "download" }
+  }
+}
+```
+
+- [ ] **Step 2: Create `tsconfig.json`**
+
+`experimentalDecorators` and `emitDecoratorMetadata` are required — the test fixture app in Task 5 uses Nest decorators.
+
+```json
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2021",
+    "lib": ["ES2021"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "resolveJsonModule": false,
+    "types": ["node", "jest"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "test"]
+}
+```
+
+- [ ] **Step 3: Create `jest.config.js`**
+
+The `transform` form is used rather than the `globals: {'ts-jest': ...}` form, which is deprecated in ts-jest 29.
+
+```js
+module.exports = {
+  testEnvironment: 'node',
+  testMatch: ['<rootDir>/test/**/*.spec.ts'],
+  moduleFileExtensions: ['ts', 'js', 'json'],
+  transform: {
+    '^.+\\.ts$': [
+      'ts-jest',
+      {
+        tsconfig: {
+          module: 'commonjs',
+          target: 'ES2021',
+          esModuleInterop: true,
+          skipLibCheck: true,
+          experimentalDecorators: true,
+          emitDecoratorMetadata: true,
+        },
+      },
+    ],
+  },
+  testTimeout: 60000,
+};
+```
+
+- [ ] **Step 4: Write the failing test**
+
+Create `test/version.spec.ts`:
+
+```ts
+import { PACKAGE_NAME } from '../src/version';
+
+describe('toolchain', () => {
+  it('compiles and exports a constant', () => {
+    expect(PACKAGE_NAME).toBe('@scope/nest-graphql');
+  });
+});
+```
+
+- [ ] **Step 5: Run test to verify it fails**
+
+Run: `pnpm install && pnpm test`
+Expected: FAIL — `Cannot find module '../src/version'`
+
+- [ ] **Step 6: Write minimal implementation**
+
+Create `src/version.ts`:
+
+```ts
+export const PACKAGE_NAME = '@scope/nest-graphql';
+```
+
+- [ ] **Step 7: Run test and build to verify both pass**
+
+Run: `pnpm test && pnpm build && node -e "require('./dist/version.js')"`
+Expected: test PASS; `dist/version.js` loads under `require()` without an ERR_REQUIRE_ESM error.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add package.json tsconfig.json jest.config.js src/version.ts test/version.spec.ts
+git commit -m "chore: scaffold CommonJS build and jest"
+```
+
+---
+
+### Task 2: Collection registration and option tolerance
+
+Highest-risk unknown: whether `schema.json` accepts everything `nest g` injects. Proven here, before any real logic exists.
+
+**Files:**
+- Create: `src/collection.json`
+- Create: `src/regenerate/schema.json`
+- Create: `src/regenerate/index.ts`
+- Test: `test/collection.spec.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces: `regenerate(options: RegenerateOptions): Rule`, exported from `src/regenerate/index.ts`. `RegenerateOptions` is exported from the same module with fields `name?: string`, `path?: string`, `project?: string`, `sourceRoot?: string`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/collection.spec.ts`. The option set mirrors exactly what `generate.action.ts` pushes.
+
+```ts
+import { SchematicTestRunner } from '@angular-devkit/schematics/testing';
+import { Tree } from '@angular-devkit/schematics';
+import * as path from 'path';
+
+const collectionPath = path.join(__dirname, '..', 'src', 'collection.json');
+
+describe('regenerate schematic registration', () => {
+  it('accepts every option nest g injects', async () => {
+    const runner = new SchematicTestRunner('nest-graphql', collectionPath);
+    const tree = Tree.empty();
+    tree.create('/nest-cli.json', '{"sourceRoot":"src"}');
+
+    const result = await runner.runSchematic(
+      'regenerate',
+      {
+        name: 'default',
+        path: 'src',
+        collection: '@scope/nest-graphql',
+        project: 'api',
+        skipImport: false,
+        type: 'graphql',
+        crud: false,
+        language: 'ts',
+        sourceRoot: 'src',
+        spec: true,
+        flat: false,
+        specFileSuffix: 'spec',
+      },
+      tree,
+    );
+
+    expect(result).toBeDefined();
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm test test/collection.spec.ts`
+Expected: FAIL — collection file does not exist.
+
+- [ ] **Step 3: Create `src/collection.json`**
+
+`extends` is what lets a user optionally repoint `nest-cli.json`'s `collection` and keep `nest g service`, `nest g resource`, etc.
+
+```json
+{
+  "$schema": "../node_modules/@angular-devkit/schematics/collection-schema.json",
+  "extends": ["@nestjs/schematics"],
+  "schematics": {
+    "regenerate": {
+      "description": "Regenerate the GraphQL schema file without booting the application",
+      "factory": "./regenerate/index#regenerate",
+      "schema": "./regenerate/schema.json",
+      "aliases": ["gql-regen"]
+    }
+  }
+}
+```
+
+- [ ] **Step 4: Create `src/regenerate/schema.json`**
+
+Note the deliberate absence of `"additionalProperties": false` — see Global Constraints.
+
+```json
+{
+  "$schema": "http://json-schema.org/schema",
+  "$id": "NestGraphqlRegenerate",
+  "title": "Regenerate GraphQL schema",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Named schema from graphql.config to regenerate.",
+      "default": "default"
+    },
+    "path": { "type": "string", "description": "Ignored; accepted for nest g compatibility." },
+    "project": { "type": "string", "description": "Nest monorepo project name." },
+    "sourceRoot": { "type": "string", "description": "Source root injected by nest g." },
+    "collection": { "type": "string" },
+    "skipImport": { "type": "boolean" },
+    "type": { "type": "string" },
+    "crud": { "type": "boolean" },
+    "language": { "type": "string" },
+    "spec": { "type": "boolean" },
+    "flat": { "type": "boolean" },
+    "specFileSuffix": { "type": "string" }
+  },
+  "required": []
+}
+```
+
+- [ ] **Step 5: Create `src/regenerate/index.ts` as a no-op Rule**
+
+```ts
+import { Rule, SchematicContext, Tree } from '@angular-devkit/schematics';
+
+export interface RegenerateOptions {
+  name?: string;
+  path?: string;
+  project?: string;
+  sourceRoot?: string;
+}
+
+export function regenerate(options: RegenerateOptions): Rule {
+  return (tree: Tree, context: SchematicContext) => {
+    context.logger.info(`regenerate: schema "${options.name ?? 'default'}"`);
+    return tree;
+  };
+}
+```
+
+- [ ] **Step 6: Run test to verify it passes**
+
+Run: `pnpm test test/collection.spec.ts`
+Expected: PASS
+
+- [ ] **Step 7: Add a regression test for the `additionalProperties` trap**
+
+Append to `test/collection.spec.ts`:
+
+```ts
+it('does not lock down additional properties', () => {
+  const schema = require('../src/regenerate/schema.json');
+  expect(schema.additionalProperties).toBeUndefined();
+});
+```
+
+- [ ] **Step 8: Run tests**
+
+Run: `pnpm test test/collection.spec.ts`
+Expected: PASS (2 tests)
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/collection.json src/regenerate/schema.json src/regenerate/index.ts test/collection.spec.ts
+git commit -m "feat: register regenerate schematic extending @nestjs/schematics"
+```
+
+---
+
+### Task 3: Metatype harvesting
+
+Pure function over a container shape. Fast to test, no Nest boot required.
+
+**Files:**
+- Create: `src/emitter/harvest.ts`
+- Test: `test/harvest.spec.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces:
+  - `RESOLVER_TYPE_METADATA: string`, `SCALAR_NAME_METADATA: string`
+  - `interface ModuleLike { metatype?: Function | null; providers: Map<unknown, { metatype?: Function | null }> }`
+  - `interface ContainerLike { values(): Iterable<ModuleLike> }`
+  - `harvest(container: ContainerLike, include?: Function[]): { resolvers: Function[]; scalars: Function[] }`
+
+The `include` parameter mirrors `gqlOptions.include`, which `ResolversExplorerService` applies at runtime via `getModules(modulesContainer, include || [])`. Without it, multi-schema configs would emit every resolver into every schema.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/harvest.spec.ts`. The metadata-key test is the important one: it pins our hardcoded keys against the real `@nestjs/graphql` values so an upstream rename fails loudly instead of silently producing an empty schema.
+
+```ts
+import 'reflect-metadata';
+import { harvest, RESOLVER_TYPE_METADATA, SCALAR_NAME_METADATA } from '../src/emitter/harvest';
+
+function moduleOf(metatype: Function | null, ...provided: Array<Function | null>) {
+  const providers = new Map<unknown, { metatype?: Function | null }>();
+  provided.forEach((m, i) => providers.set(i, { metatype: m }));
+  return { metatype, providers };
+}
+
+function containerOf(...modules: ReturnType<typeof moduleOf>[]) {
+  return { values: () => modules };
+}
+
+describe('harvest', () => {
+  it('collects classes carrying resolver metadata', () => {
+    class RecipesResolver {}
+    class PlainService {}
+    class AppModule {}
+    Reflect.defineMetadata(RESOLVER_TYPE_METADATA, 'Query', RecipesResolver);
+
+    const { resolvers } = harvest(containerOf(moduleOf(AppModule, RecipesResolver, PlainService)));
+
+    expect(resolvers).toEqual([RecipesResolver]);
+  });
+
+  it('collects scalars separately and skips null metatypes', () => {
+    class DateScalar {}
+    class AppModule {}
+    Reflect.defineMetadata(SCALAR_NAME_METADATA, 'Date', DateScalar);
+
+    const { resolvers, scalars } = harvest(containerOf(moduleOf(AppModule, DateScalar, null)));
+
+    expect(scalars).toEqual([DateScalar]);
+    expect(resolvers).toEqual([]);
+  });
+
+  it('restricts harvesting to included modules', () => {
+    class AdminResolver {}
+    class PublicResolver {}
+    class AdminModule {}
+    class PublicModule {}
+    Reflect.defineMetadata(RESOLVER_TYPE_METADATA, 'Query', AdminResolver);
+    Reflect.defineMetadata(RESOLVER_TYPE_METADATA, 'Query', PublicResolver);
+
+    const container = containerOf(
+      moduleOf(AdminModule, AdminResolver),
+      moduleOf(PublicModule, PublicResolver),
+    );
+
+    expect(harvest(container, [AdminModule]).resolvers).toEqual([AdminResolver]);
+  });
+
+  it('harvests every module when include is empty or absent', () => {
+    class A {}
+    class B {}
+    class ModA {}
+    class ModB {}
+    Reflect.defineMetadata(RESOLVER_TYPE_METADATA, 'Query', A);
+    Reflect.defineMetadata(RESOLVER_TYPE_METADATA, 'Query', B);
+
+    const container = containerOf(moduleOf(ModA, A), moduleOf(ModB, B));
+
+    expect(harvest(container).resolvers).toEqual([A, B]);
+    expect(harvest(container, []).resolvers).toEqual([A, B]);
+  });
+
+  it('matches the metadata keys @nestjs/graphql actually uses', () => {
+    const constants = require('@nestjs/graphql/dist/graphql.constants');
+    expect(RESOLVER_TYPE_METADATA).toBe(constants.RESOLVER_TYPE_METADATA);
+    expect(SCALAR_NAME_METADATA).toBe(constants.SCALAR_NAME_METADATA);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm test test/harvest.spec.ts`
+Expected: FAIL — `Cannot find module '../src/emitter/harvest'`
+
+- [ ] **Step 3: Write the implementation**
+
+Create `src/emitter/harvest.ts`. The keys are hardcoded rather than deep-imported so the emitter has no runtime coupling to `@nestjs/graphql`'s internal file layout; Step 1's third test guards the values.
+
+```ts
+export const RESOLVER_TYPE_METADATA = 'graphql:resolver_type';
+export const SCALAR_NAME_METADATA = 'graphql:scalar_name';
+
+export interface ModuleLike {
+  metatype?: Function | null;
+  providers: Map<unknown, { metatype?: Function | null }>;
+}
+
+export interface ContainerLike {
+  values(): Iterable<ModuleLike>;
+}
+
+export function harvest(
+  container: ContainerLike,
+  include?: Function[],
+): { resolvers: Function[]; scalars: Function[] } {
+  const resolvers: Function[] = [];
+  const scalars: Function[] = [];
+  const filter = include && include.length ? new Set(include) : null;
+
+  for (const module of container.values()) {
+    if (filter && (!module.metatype || !filter.has(module.metatype))) continue;
+
+    for (const wrapper of module.providers.values()) {
+      const metatype = wrapper.metatype;
+      if (typeof metatype !== 'function') continue;
+      if (Reflect.getMetadata(RESOLVER_TYPE_METADATA, metatype)) resolvers.push(metatype);
+      if (Reflect.getMetadata(SCALAR_NAME_METADATA, metatype)) scalars.push(metatype);
+    }
+  }
+
+  return { resolvers, scalars };
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `pnpm test test/harvest.spec.ts`
+Expected: PASS (5 tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/emitter/harvest.ts test/harvest.spec.ts
+git commit -m "feat: harvest resolver and scalar metatypes from a Nest container"
+```
+
+---
+
+### Task 4: SDL serialization
+
+Reproduces `GraphQLSchemaBuilder.generateSchema()`'s output transformation. `GraphQLSchemaBuilder` is not exported by `GraphQLSchemaBuilderModule`, so it cannot be retrieved with `app.get()` — this is a deliberate reimplementation.
+
+**Files:**
+- Create: `src/emitter/serialize.ts`
+- Test: `test/serialize.spec.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces: `serialize(schema: GraphQLSchema, opts: SerializeOptions): Promise<string>` where `SerializeOptions` is `{ sortSchema?: boolean; addNewlineAtEnd?: boolean; transformSchema?: (s: GraphQLSchema) => GraphQLSchema | Promise<GraphQLSchema> }`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/serialize.spec.ts`:
+
+```ts
+import { GraphQLObjectType, GraphQLSchema, GraphQLString } from 'graphql';
+import { serialize } from '../src/emitter/serialize';
+
+function schemaWithFields(...names: string[]) {
+  const fields: Record<string, { type: typeof GraphQLString }> = {};
+  for (const n of names) fields[n] = { type: GraphQLString };
+  return new GraphQLSchema({ query: new GraphQLObjectType({ name: 'Query', fields }) });
+}
+
+describe('serialize', () => {
+  it('prefixes the @nestjs/graphql SDL header', async () => {
+    const out = await serialize(schemaWithFields('a'), {});
+    const header = require('@nestjs/graphql/dist/graphql.constants').GRAPHQL_SDL_FILE_HEADER;
+    expect(out.startsWith(header)).toBe(true);
+  });
+
+  it('sorts lexicographically when asked', async () => {
+    const out = await serialize(schemaWithFields('zeta', 'alpha'), { sortSchema: true });
+    expect(out.indexOf('alpha')).toBeLessThan(out.indexOf('zeta'));
+  });
+
+  it('preserves declaration order when not asked', async () => {
+    const out = await serialize(schemaWithFields('zeta', 'alpha'), { sortSchema: false });
+    expect(out.indexOf('zeta')).toBeLessThan(out.indexOf('alpha'));
+  });
+
+  it('appends the trailing newline marker when asked', async () => {
+    const end = require('@nestjs/graphql/dist/graphql.constants').GRAPHQL_SDL_FILE_END;
+    const out = await serialize(schemaWithFields('a'), { addNewlineAtEnd: true });
+    expect(out.endsWith(end)).toBe(true);
+  });
+
+  it('applies transformSchema before printing', async () => {
+    const out = await serialize(schemaWithFields('a'), {
+      transformSchema: () => schemaWithFields('replaced'),
+    });
+    expect(out).toContain('replaced');
+    expect(out).not.toContain('a: String');
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm test test/serialize.spec.ts`
+Expected: FAIL — `Cannot find module '../src/emitter/serialize'`
+
+- [ ] **Step 3: Write the implementation**
+
+Create `src/emitter/serialize.ts`:
+
+```ts
+import { GraphQLSchema, lexicographicSortSchema, printSchema } from 'graphql';
+
+export interface SerializeOptions {
+  sortSchema?: boolean;
+  addNewlineAtEnd?: boolean;
+  transformSchema?: (schema: GraphQLSchema) => GraphQLSchema | Promise<GraphQLSchema>;
+}
+
+export async function serialize(
+  schema: GraphQLSchema,
+  opts: SerializeOptions,
+): Promise<string> {
+  const constants = require('@nestjs/graphql/dist/graphql.constants');
+  const transformed = opts.transformSchema ? await opts.transformSchema(schema) : schema;
+
+  let out =
+    constants.GRAPHQL_SDL_FILE_HEADER +
+    printSchema(opts.sortSchema ? lexicographicSortSchema(transformed) : transformed);
+
+  if (opts.addNewlineAtEnd) out += constants.GRAPHQL_SDL_FILE_END;
+  return out;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `pnpm test test/serialize.spec.ts`
+Expected: PASS (5 tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/emitter/serialize.ts test/serialize.spec.ts
+git commit -m "feat: serialize a GraphQLSchema to SDL matching the boot path"
+```
+
+---
+
+### Task 5: Preview-boot build and byte-parity proof
+
+The project's spine. Everything downstream is worthless if this fails.
+
+**Files:**
+- Create: `test/fixtures/basic/recipe.model.ts`
+- Create: `test/fixtures/basic/recipes.resolver.ts`
+- Create: `test/fixtures/basic/app.module.ts`
+- Create: `test/fixtures/exploding/app.module.ts`
+- Create: `src/emitter/build.ts`
+- Test: `test/parity.spec.ts`
+
+**Interfaces:**
+- Consumes: `harvest()` from Task 3, `serialize()` from Task 4.
+- Produces: `buildSdl(appModule: unknown, opts: BuildSdlOptions): Promise<string>` where `BuildSdlOptions` is `SerializeOptions & { buildSchemaOptions?: Record<string, unknown>; include?: Function[] }`.
+
+Two fixtures are required. `basic/` must boot cleanly, because the parity test uses a real boot as ground truth. The provider that throws lives in `exploding/`, which is only ever preview-booted.
+
+- [ ] **Step 1: Create the clean fixture**
+
+Create `test/fixtures/basic/recipe.model.ts`:
+
+```ts
+import { Field, ID, ObjectType } from '@nestjs/graphql';
+
+@ObjectType()
+export class Recipe {
+  @Field(() => ID)
+  id!: string;
+
+  @Field()
+  title!: string;
+
+  @Field({ nullable: true })
+  description?: string;
+}
+```
+
+Create `test/fixtures/basic/recipes.resolver.ts`:
+
+```ts
+import { Args, ID, Query, Resolver } from '@nestjs/graphql';
+import { Recipe } from './recipe.model';
+
+@Resolver(() => Recipe)
+export class RecipesResolver {
+  @Query(() => [Recipe])
+  recipes(): Recipe[] {
+    return [];
+  }
+
+  @Query(() => Recipe, { nullable: true })
+  recipe(@Args('id', { type: () => ID }) id: string): Recipe | null {
+    return null;
+  }
+}
+```
+
+Create `test/fixtures/basic/app.module.ts`:
+
+```ts
+import { Module } from '@nestjs/common';
+import { GraphQLModule } from '@nestjs/graphql';
+import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
+import { join } from 'path';
+import { RecipesResolver } from './recipes.resolver';
+
+export const AUTO_SCHEMA_FILE = join(__dirname, 'boot-schema.gql');
+
+@Module({
+  imports: [
+    GraphQLModule.forRoot<ApolloDriverConfig>({
+      driver: ApolloDriver,
+      autoSchemaFile: AUTO_SCHEMA_FILE,
+      sortSchema: true,
+    }),
+  ],
+  providers: [RecipesResolver],
+})
+export class AppModule {}
+```
+
+- [ ] **Step 2: Create the side-effect fixture**
+
+Create `test/fixtures/exploding/app.module.ts`. This module can never be booted normally — that is the point.
+
+```ts
+import { Injectable, Module } from '@nestjs/common';
+import { GraphQLModule } from '@nestjs/graphql';
+import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
+import { join } from 'path';
+import { RecipesResolver } from '../basic/recipes.resolver';
+
+@Injectable()
+export class ExplodingService {
+  constructor() {
+    throw new Error('provider was instantiated — preview mode failed');
+  }
+}
+
+@Module({
+  imports: [
+    GraphQLModule.forRoot<ApolloDriverConfig>({
+      driver: ApolloDriver,
+      autoSchemaFile: join(__dirname, 'never-written.gql'),
+      sortSchema: true,
+    }),
+  ],
+  providers: [RecipesResolver, ExplodingService],
+})
+export class ExplodingAppModule {}
+```
+
+- [ ] **Step 3: Write the failing parity test**
+
+Create `test/parity.spec.ts`. The third test is a negative control: it proves the `exploding` fixture would genuinely fail a normal boot, so the second test's pass is meaningful rather than vacuous.
+
+```ts
+import 'reflect-metadata';
+import { readFileSync, rmSync, existsSync } from 'fs';
+import { buildSdl } from '../src/emitter/build';
+import { AppModule, AUTO_SCHEMA_FILE } from './fixtures/basic/app.module';
+import { ExplodingAppModule } from './fixtures/exploding/app.module';
+
+describe('byte parity with the boot path', () => {
+  afterAll(() => {
+    if (existsSync(AUTO_SCHEMA_FILE)) rmSync(AUTO_SCHEMA_FILE);
+  });
+
+  it('produces output identical to autoSchemaFile', async () => {
+    // Ground truth: a real boot, which writes AUTO_SCHEMA_FILE during init.
+    const { NestFactory } = require('@nestjs/core');
+    const app = await NestFactory.create(AppModule, { logger: false });
+    await app.init();
+    const bootSdl = readFileSync(AUTO_SCHEMA_FILE, 'utf8');
+    await app.close();
+
+    const ourSdl = await buildSdl(AppModule, { sortSchema: true });
+
+    expect(ourSdl).toBe(bootSdl);
+  });
+
+  it('never instantiates providers', async () => {
+    await expect(
+      buildSdl(ExplodingAppModule, { sortSchema: true }),
+    ).resolves.toContain('type Recipe');
+  });
+
+  it('negative control: the exploding fixture really does fail a normal boot', async () => {
+    const { NestFactory } = require('@nestjs/core');
+    await expect(
+      NestFactory.create(ExplodingAppModule, { logger: false, abortOnError: false }),
+    ).rejects.toThrow(/provider was instantiated/);
+  });
+});
+```
+
+- [ ] **Step 4: Run test to verify it fails**
+
+Run: `pnpm test test/parity.spec.ts`
+Expected: FAIL — `Cannot find module '../src/emitter/build'`
+
+- [ ] **Step 5: Write the implementation**
+
+Create `src/emitter/build.ts`. `createApplicationContext` is used rather than `create` because the schema builder needs no HTTP layer.
+
+```ts
+import { GraphQLSchema } from 'graphql';
+import { harvest, ContainerLike } from './harvest';
+import { serialize, SerializeOptions } from './serialize';
+
+export interface BuildSdlOptions extends SerializeOptions {
+  buildSchemaOptions?: Record<string, unknown>;
+  include?: Function[];
+}
+
+export async function buildSdl(
+  appModule: unknown,
+  opts: BuildSdlOptions,
+): Promise<string> {
+  const { NestFactory, ModulesContainer } = require('@nestjs/core');
+  const { GraphQLSchemaBuilderModule, GraphQLSchemaFactory } = require('@nestjs/graphql');
+
+  // Preview mode: module graph is built, providers are never constructed.
+  const previewCtx = await NestFactory.createApplicationContext(appModule, {
+    preview: true,
+    abortOnError: false,
+    logger: false,
+  });
+
+  let sdl: string;
+  try {
+    const container = previewCtx.get(ModulesContainer) as ContainerLike;
+    const { resolvers, scalars } = harvest(container, opts.include);
+
+    const schemaCtx = await NestFactory.createApplicationContext(
+      GraphQLSchemaBuilderModule,
+      { logger: false },
+    );
+    try {
+      const factory = schemaCtx.get(GraphQLSchemaFactory);
+      const schema: GraphQLSchema = await factory.create(
+        resolvers,
+        scalars,
+        opts.buildSchemaOptions ?? {},
+      );
+      sdl = await serialize(schema, opts);
+    } finally {
+      await schemaCtx.close();
+    }
+  } finally {
+    await previewCtx.close();
+  }
+
+  return sdl;
+}
+```
+
+- [ ] **Step 6: Run test to verify it passes**
+
+Run: `pnpm test test/parity.spec.ts`
+Expected: PASS (3 tests)
+
+If parity fails, diff the two strings before changing anything else — the likely causes are a missing header constant, a `sortSchema` mismatch, or `addNewlineAtEnd` defaulting differently. Do not "fix" it by relaxing the assertion.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/emitter/build.ts test/fixtures test/parity.spec.ts
+git commit -m "feat: build SDL via preview-mode boot with byte parity proof"
+```
+
+---
+
+### Task 6: Config resolution
+
+**Files:**
+- Create: `src/config/resolve.ts`
+- Test: `test/config.spec.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces:
+  - `interface SchemaConfig { autoSchemaFile: string; sortSchema?: boolean; addNewlineAtEnd?: boolean; buildSchemaOptions?: Record<string, unknown>; transformSchema?: (s: any) => any; include?: Function[] }`
+  - `resolveConfig(distRoot: string, schemaName: string): SchemaConfig` — throws with both attempted paths listed when not found.
+  - `CONFIG_BASENAME = 'graphql.config.js'`
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/config.spec.ts`:
+
+```ts
+import { mkdtempSync, mkdirSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import * as path from 'path';
+import { resolveConfig } from '../src/config/resolve';
+
+function scratch(): string {
+  return mkdtempSync(path.join(tmpdir(), 'gqlcfg-'));
+}
+
+const CONFIG_JS = `
+module.exports.schemas = {
+  default: { autoSchemaFile: 'src/schema.gql', sortSchema: true },
+  admin: { autoSchemaFile: 'src/admin.gql' },
+};
+`;
+
+describe('resolveConfig', () => {
+  it('finds the config at the dist root', () => {
+    const dir = scratch();
+    writeFileSync(path.join(dir, 'graphql.config.js'), CONFIG_JS);
+    expect(resolveConfig(dir, 'default').autoSchemaFile).toBe('src/schema.gql');
+  });
+
+  it('falls back to a nested src directory', () => {
+    const dir = scratch();
+    mkdirSync(path.join(dir, 'src'));
+    writeFileSync(path.join(dir, 'src', 'graphql.config.js'), CONFIG_JS);
+    expect(resolveConfig(dir, 'admin').autoSchemaFile).toBe('src/admin.gql');
+  });
+
+  it('lists every attempted path when the config is missing', () => {
+    const dir = scratch();
+    expect(() => resolveConfig(dir, 'default')).toThrow(/graphql\.config\.js/);
+    expect(() => resolveConfig(dir, 'default')).toThrow(/src/);
+  });
+
+  it('names the missing schema key and the available ones', () => {
+    const dir = scratch();
+    writeFileSync(path.join(dir, 'graphql.config.js'), CONFIG_JS);
+    expect(() => resolveConfig(dir, 'nope')).toThrow(/nope/);
+    expect(() => resolveConfig(dir, 'nope')).toThrow(/default, admin/);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm test test/config.spec.ts`
+Expected: FAIL — `Cannot find module '../src/config/resolve'`
+
+- [ ] **Step 3: Write the implementation**
+
+Create `src/config/resolve.ts`:
+
+```ts
+import { existsSync } from 'fs';
+import * as path from 'path';
+
+export const CONFIG_BASENAME = 'graphql.config.js';
+
+export interface SchemaConfig {
+  autoSchemaFile: string;
+  sortSchema?: boolean;
+  addNewlineAtEnd?: boolean;
+  buildSchemaOptions?: Record<string, unknown>;
+  transformSchema?: (schema: any) => any;
+  include?: Function[];
+}
+
+export function resolveConfig(distRoot: string, schemaName: string): SchemaConfig {
+  const candidates = [
+    path.join(distRoot, CONFIG_BASENAME),
+    path.join(distRoot, 'src', CONFIG_BASENAME),
+  ];
+
+  const found = candidates.find((c) => existsSync(c));
+  if (!found) {
+    throw new Error(
+      `Could not find a compiled ${CONFIG_BASENAME}. Looked in:\n` +
+        candidates.map((c) => `  - ${c}`).join('\n') +
+        `\nRun "nest build" first, and export a "schemas" object from graphql.config.ts.`,
+    );
+  }
+
+  const mod = require(found);
+  const schemas = mod.schemas ?? mod.default?.schemas;
+  if (!schemas) {
+    throw new Error(`${found} does not export a "schemas" object.`);
+  }
+
+  const config = schemas[schemaName];
+  if (!config) {
+    throw new Error(
+      `No schema named "${schemaName}" in ${found}. Available: ${Object.keys(schemas).join(', ')}`,
+    );
+  }
+
+  return config;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `pnpm test test/config.spec.ts`
+Expected: PASS (4 tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/config/resolve.ts test/config.spec.ts
+git commit -m "feat: resolve compiled graphql.config.js and named schemas"
+```
+
+---
+
+### Task 7: Emitter child process
+
+Isolates the user's app from the CLI process and pins module resolution to the user's project.
+
+**Files:**
+- Create: `src/emitter/protocol.ts`
+- Create: `src/emitter/child.ts`
+- Create: `src/emitter/spawn.ts`
+- Test: `test/spawn.spec.ts`
+
+**Interfaces:**
+- Consumes: `buildSdl()` (Task 5), `resolveConfig()` (Task 6).
+- Produces, all from `src/emitter/protocol.ts` so the parent and child share one definition:
+  - `interface EmitRequest { projectRoot: string; distRoot: string; appModulePath: string; schemaName: string }`
+  - `interface EmitSuccess { ok: true; sdl: string; outFile: string }`
+  - `interface EmitFailure { ok: false; message: string; stack?: string }`
+- Also produces `spawnEmitter(req: EmitRequest): Promise<EmitSuccess>` from `src/emitter/spawn.ts` — rejects with an `Error` carrying the child's message on failure.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/spawn.spec.ts`. It reads from `test/fixtures-dist/`, the compiled output added in Step 5 — the child process loads JavaScript, never TypeScript.
+
+```ts
+import { mkdtempSync, writeFileSync, cpSync, mkdirSync } from 'fs';
+import { tmpdir } from 'os';
+import * as path from 'path';
+import { spawnEmitter } from '../src/emitter/spawn';
+
+describe('spawnEmitter', () => {
+  it('returns SDL from a child process', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'gqlspawn-'));
+    const distRoot = path.join(dir, 'dist');
+    mkdirSync(distRoot, { recursive: true });
+    cpSync(path.join(__dirname, 'fixtures-dist'), distRoot, { recursive: true });
+    writeFileSync(
+      path.join(distRoot, 'graphql.config.js'),
+      `module.exports.schemas = { default: { autoSchemaFile: 'src/schema.gql', sortSchema: true } };`,
+    );
+
+    const result = await spawnEmitter({
+      projectRoot: process.cwd(),
+      distRoot,
+      appModulePath: path.join(distRoot, 'basic', 'app.module.js'),
+      schemaName: 'default',
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.sdl).toContain('type Recipe');
+    expect(result.outFile).toBe('src/schema.gql');
+  });
+
+  it('surfaces the child error message on failure', async () => {
+    await expect(
+      spawnEmitter({
+        projectRoot: process.cwd(),
+        distRoot: '/nonexistent',
+        appModulePath: '/nonexistent/app.module.js',
+        schemaName: 'default',
+      }),
+    ).rejects.toThrow(/graphql\.config\.js|Cannot find module/);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm test test/spawn.spec.ts`
+Expected: FAIL — `Cannot find module '../src/emitter/spawn'`
+
+- [ ] **Step 3: Write `src/emitter/protocol.ts`**
+
+```ts
+export interface EmitRequest {
+  projectRoot: string;
+  distRoot: string;
+  appModulePath: string;
+  schemaName: string;
+}
+
+export interface EmitSuccess {
+  ok: true;
+  sdl: string;
+  outFile: string;
+}
+
+export interface EmitFailure {
+  ok: false;
+  message: string;
+  stack?: string;
+}
+```
+
+- [ ] **Step 4: Write `src/emitter/child.ts`**
+
+The `.env` load addresses the spec's first failure mode: preview mode skips provider construction but not module evaluation, so a `ConfigModule` with a `validationSchema` still throws on import without configuration present.
+
+```ts
+import { existsSync } from 'fs';
+import * as path from 'path';
+import { buildSdl } from './build';
+import { resolveConfig } from '../config/resolve';
+import { EmitRequest } from './protocol';
+
+function loadDotEnv(projectRoot: string): void {
+  const envPath = path.join(projectRoot, '.env');
+  if (!existsSync(envPath)) return;
+  try {
+    const dotenvPath = require.resolve('dotenv', { paths: [projectRoot] });
+    require(dotenvPath).config({ path: envPath });
+  } catch {
+    // dotenv is not installed in the target project; proceed without it.
+  }
+}
+
+async function main(): Promise<void> {
+  const req: EmitRequest = JSON.parse(process.argv[2]);
+
+  loadDotEnv(req.projectRoot);
+
+  const config = resolveConfig(req.distRoot, req.schemaName);
+  const mod = require(req.appModulePath);
+  const AppModule = mod.AppModule ?? mod.default;
+  if (!AppModule) {
+    throw new Error(`${req.appModulePath} does not export AppModule.`);
+  }
+
+  const sdl = await buildSdl(AppModule, {
+    sortSchema: config.sortSchema,
+    addNewlineAtEnd: config.addNewlineAtEnd,
+    transformSchema: config.transformSchema,
+    buildSchemaOptions: config.buildSchemaOptions,
+    include: config.include,
+  });
+
+  process.stdout.write(
+    JSON.stringify({ ok: true, sdl, outFile: config.autoSchemaFile }),
+  );
+}
+
+main().catch((err: Error) => {
+  process.stdout.write(
+    JSON.stringify({ ok: false, message: err.message, stack: err.stack }),
+  );
+  process.exit(1);
+});
+```
+
+- [ ] **Step 5: Write `src/emitter/spawn.ts`**
+
+`NODE_PATH` pins the child to the user's Nest packages — see Global Constraints.
+
+```ts
+import { spawn } from 'child_process';
+import * as path from 'path';
+import { EmitRequest, EmitSuccess, EmitFailure } from './protocol';
+
+export { EmitRequest, EmitSuccess, EmitFailure };
+
+export function spawnEmitter(req: EmitRequest): Promise<EmitSuccess> {
+  const childEntry = path.join(__dirname, 'child.js');
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ['-r', 'reflect-metadata', childEntry, JSON.stringify(req)],
+      {
+        cwd: req.projectRoot,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          NODE_PATH: path.join(req.projectRoot, 'node_modules'),
+        },
+      },
+    );
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => (stdout += d.toString()));
+    child.stderr.on('data', (d) => (stderr += d.toString()));
+
+    child.on('close', () => {
+      let parsed: EmitSuccess | EmitFailure;
+      try {
+        parsed = JSON.parse(stdout.trim());
+      } catch {
+        reject(new Error(`Emitter produced no usable output.\n${stderr || stdout}`));
+        return;
+      }
+      if (parsed.ok) resolve(parsed);
+      else reject(new Error(parsed.message));
+    });
+  });
+}
+```
+
+- [ ] **Step 6: Add the fixture compile step**
+
+The child process loads compiled JavaScript, so both fixtures must be built before `test/spawn.spec.ts` runs. `rootDir test` preserves the `basic/` and `exploding/` subdirectory layout the test copies from.
+
+Add to `package.json` scripts:
+
+```json
+"pretest": "pnpm build && tsc test/fixtures/basic/*.ts test/fixtures/exploding/*.ts --outDir test/fixtures-dist --rootDir test/fixtures --module commonjs --target ES2021 --experimentalDecorators --emitDecoratorMetadata --esModuleInterop --skipLibCheck"
+```
+
+Add `test/fixtures-dist/` to `.gitignore`:
+
+```bash
+echo "test/fixtures-dist/" >> .gitignore
+echo "dist/" >> .gitignore
+echo "node_modules/" >> .gitignore
+```
+
+- [ ] **Step 7: Run test to verify it passes**
+
+Run: `pnpm test test/spawn.spec.ts`
+Expected: PASS (2 tests)
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/emitter/protocol.ts src/emitter/child.ts src/emitter/spawn.ts test/spawn.spec.ts package.json .gitignore
+git commit -m "feat: run the emitter in an isolated child process"
+```
+
+---
+
+### Task 8: Project resolution from nest-cli.json
+
+**Files:**
+- Create: `src/config/project.ts`
+- Test: `test/project.spec.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces:
+  - `interface ResolvedProject { sourceRoot: string; distRoot: string; entryFile: string }`
+  - `resolveProject(nestCli: Record<string, any>, projectName?: string): ResolvedProject`
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/project.spec.ts`:
+
+```ts
+import { resolveProject } from '../src/config/project';
+
+describe('resolveProject', () => {
+  it('handles a standard single-app layout', () => {
+    const r = resolveProject({ sourceRoot: 'src', entryFile: 'main' });
+    expect(r).toEqual({ sourceRoot: 'src', distRoot: 'dist', entryFile: 'main' });
+  });
+
+  it('defaults entryFile to main when absent', () => {
+    expect(resolveProject({ sourceRoot: 'src' }).entryFile).toBe('main');
+  });
+
+  it('resolves a named monorepo project', () => {
+    const r = resolveProject(
+      {
+        sourceRoot: 'apps/api/src',
+        monorepo: true,
+        projects: {
+          api: { sourceRoot: 'apps/api/src', root: 'apps/api' },
+          admin: { sourceRoot: 'apps/admin/src', root: 'apps/admin' },
+        },
+      },
+      'admin',
+    );
+    expect(r.sourceRoot).toBe('apps/admin/src');
+    expect(r.distRoot).toBe('dist/apps/admin');
+  });
+
+  it('throws listing available projects for an unknown name', () => {
+    expect(() =>
+      resolveProject({ sourceRoot: 'src', projects: { api: { sourceRoot: 'apps/api/src' } } }, 'ghost'),
+    ).toThrow(/ghost.*api/s);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm test test/project.spec.ts`
+Expected: FAIL — `Cannot find module '../src/config/project'`
+
+- [ ] **Step 3: Write the implementation**
+
+Create `src/config/project.ts`:
+
+```ts
+export interface ResolvedProject {
+  sourceRoot: string;
+  distRoot: string;
+  entryFile: string;
+}
+
+export function resolveProject(
+  nestCli: Record<string, any>,
+  projectName?: string,
+): ResolvedProject {
+  const projects = nestCli.projects ?? {};
+
+  if (projectName) {
+    const project = projects[projectName];
+    if (!project) {
+      throw new Error(
+        `Unknown project "${projectName}". Available: ${Object.keys(projects).join(', ') || '(none)'}`,
+      );
+    }
+    const root = project.root ?? '';
+    return {
+      sourceRoot: project.sourceRoot,
+      distRoot: root ? `dist/${root}` : 'dist',
+      entryFile: project.entryFile ?? nestCli.entryFile ?? 'main',
+    };
+  }
+
+  return {
+    sourceRoot: nestCli.sourceRoot ?? 'src',
+    distRoot: 'dist',
+    entryFile: nestCli.entryFile ?? 'main',
+  };
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `pnpm test test/project.spec.ts`
+Expected: PASS (4 tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/config/project.ts test/project.spec.ts
+git commit -m "feat: resolve nest-cli.json project layouts including monorepo"
+```
+
+---
+
+### Task 9: Wire the schematic end to end
+
+Replaces the Task 2 no-op with the real orchestration.
+
+**Files:**
+- Modify: `src/regenerate/index.ts` (full replacement)
+- Test: `test/regenerate.spec.ts`
+
+**Interfaces:**
+- Consumes: `resolveProject()` (Task 8), `spawnEmitter()` (Task 7).
+- Produces: final `regenerate(options: RegenerateOptions): Rule`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/regenerate.spec.ts`. `spawnEmitter` and the build shell-out are mocked — this task tests orchestration and `Tree` writes, not schema generation (covered by Task 5).
+
+```ts
+import { SchematicTestRunner } from '@angular-devkit/schematics/testing';
+import { Tree } from '@angular-devkit/schematics';
+import * as path from 'path';
+
+jest.mock('../src/emitter/spawn', () => ({
+  spawnEmitter: jest.fn().mockResolvedValue({
+    ok: true,
+    sdl: 'type Query {\n  ok: String\n}\n',
+    outFile: 'src/schema.gql',
+  }),
+}));
+
+jest.mock('../src/regenerate/build-project', () => ({
+  buildProject: jest.fn().mockResolvedValue(undefined),
+}));
+
+const collectionPath = path.join(__dirname, '..', 'src', 'collection.json');
+
+function treeWithNestCli(json: object): Tree {
+  const tree = Tree.empty();
+  tree.create('/nest-cli.json', JSON.stringify(json));
+  return tree;
+}
+
+describe('regenerate', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('writes the schema file returned by the emitter', async () => {
+    const runner = new SchematicTestRunner('nest-graphql', collectionPath);
+    const tree = treeWithNestCli({ sourceRoot: 'src' });
+
+    const result = await runner.runSchematic('regenerate', { name: 'default' }, tree);
+
+    expect(result.readContent('/src/schema.gql')).toContain('type Query');
+  });
+
+  it('overwrites an existing stale schema file', async () => {
+    const runner = new SchematicTestRunner('nest-graphql', collectionPath);
+    const tree = treeWithNestCli({ sourceRoot: 'src' });
+    tree.create('/src/schema.gql', 'type Query { stale: String }\n');
+
+    const result = await runner.runSchematic('regenerate', { name: 'default' }, tree);
+
+    expect(result.readContent('/src/schema.gql')).not.toContain('stale');
+  });
+
+  it('reports "up to date" and leaves content alone when already in sync', async () => {
+    const runner = new SchematicTestRunner('nest-graphql', collectionPath);
+    const messages: string[] = [];
+    runner.logger.subscribe((e) => messages.push(e.message));
+
+    const tree = treeWithNestCli({ sourceRoot: 'src' });
+    tree.create('/src/schema.gql', 'type Query {\n  ok: String\n}\n');
+
+    const result = await runner.runSchematic('regenerate', { name: 'default' }, tree);
+
+    expect(messages.join('\n')).toMatch(/up to date/);
+    expect(result.readContent('/src/schema.gql')).toBe('type Query {\n  ok: String\n}\n');
+  });
+
+  it('passes the project name through to the build step', async () => {
+    const { buildProject } = require('../src/regenerate/build-project');
+    const runner = new SchematicTestRunner('nest-graphql', collectionPath);
+    const tree = treeWithNestCli({
+      sourceRoot: 'apps/api/src',
+      projects: { api: { sourceRoot: 'apps/api/src', root: 'apps/api' } },
+    });
+
+    await runner.runSchematic('regenerate', { name: 'default', project: 'api' }, tree);
+
+    expect(buildProject).toHaveBeenCalledWith(expect.any(String), 'api');
+  });
+
+  it('fails with a clear message when nest-cli.json is absent', async () => {
+    const runner = new SchematicTestRunner('nest-graphql', collectionPath);
+    await expect(
+      runner.runSchematic('regenerate', { name: 'default' }, Tree.empty()),
+    ).rejects.toThrow(/nest-cli\.json/);
+  });
+});
+```
+
+`--dry-run` itself needs no test here: it is a workflow-level concern handled entirely by `@angular-devkit/schematics-cli`, which declines to commit the `Tree`. The schematic behaves identically either way, so testing it would be testing Angular's code, not ours.
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pnpm test test/regenerate.spec.ts`
+Expected: FAIL — `Cannot find module '../src/regenerate/build-project'`
+
+- [ ] **Step 3: Create `src/regenerate/build-project.ts`**
+
+```ts
+import { spawn } from 'child_process';
+
+export function buildProject(projectRoot: string, projectName?: string): Promise<void> {
+  const args = ['nest', 'build'];
+  if (projectName) args.push(projectName);
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('npx', args, { cwd: projectRoot, stdio: 'inherit', shell: true });
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`"nest build" exited with code ${code}.`));
+    });
+  });
+}
+```
+
+- [ ] **Step 4: Replace `src/regenerate/index.ts`**
+
+```ts
+import { Rule, SchematicContext, SchematicsException, Tree } from '@angular-devkit/schematics';
+import * as path from 'path';
+import { resolveProject } from '../config/project';
+import { spawnEmitter } from '../emitter/spawn';
+import { buildProject } from './build-project';
+
+export interface RegenerateOptions {
+  name?: string;
+  path?: string;
+  project?: string;
+  sourceRoot?: string;
+}
+
+export function regenerate(options: RegenerateOptions): Rule {
+  return async (tree: Tree, context: SchematicContext) => {
+    const nestCliBuffer = tree.read('/nest-cli.json');
+    if (!nestCliBuffer) {
+      throw new SchematicsException(
+        'Could not find nest-cli.json. Run this from a NestJS project root.',
+      );
+    }
+
+    const nestCli = JSON.parse(nestCliBuffer.toString('utf8'));
+    const project = resolveProject(nestCli, options.project);
+    const projectRoot = process.cwd();
+    const schemaName = options.name ?? 'default';
+
+    context.logger.info(`Building project${options.project ? ` "${options.project}"` : ''}...`);
+    await buildProject(projectRoot, options.project);
+
+    const result = await spawnEmitter({
+      projectRoot,
+      distRoot: path.join(projectRoot, project.distRoot),
+      appModulePath: path.join(projectRoot, project.distRoot, 'app.module.js'),
+      schemaName,
+    });
+
+    const target = '/' + result.outFile.replace(/^\.?\//, '');
+    const existing = tree.read(target);
+
+    if (existing && existing.toString('utf8') === result.sdl) {
+      context.logger.info(`${target} is up to date.`);
+      return tree;
+    }
+
+    if (existing) tree.overwrite(target, result.sdl);
+    else tree.create(target, result.sdl);
+
+    context.logger.info(`${existing ? 'Updated' : 'Created'} ${target}`);
+    return tree;
+  };
+}
+```
+
+- [ ] **Step 5: Run test to verify it passes**
+
+Run: `pnpm test test/regenerate.spec.ts`
+Expected: PASS (5 tests)
+
+- [ ] **Step 6: Run the whole suite**
+
+Run: `pnpm test`
+Expected: PASS — all suites.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/regenerate/index.ts src/regenerate/build-project.ts test/regenerate.spec.ts
+git commit -m "feat: wire regenerate schematic end to end"
+```
+
+---
+
+### Task 10: Documentation
+
+**Files:**
+- Create: `README.md`
+
+**Interfaces:**
+- Consumes: everything
+- Produces: nothing
+
+- [ ] **Step 1: Write `README.md`**
+
+````markdown
+# @scope/nest-graphql
+
+Regenerate a NestJS code-first GraphQL schema without booting your app — no database, no Redis, no secrets.
+
+## Install
+
+```bash
+pnpm add -D @scope/nest-graphql
+```
+
+## Use
+
+```bash
+nest g -c @scope/nest-graphql regenerate
+```
+
+Optionally set the collection as your default in `nest-cli.json` to drop the `-c` flag. The collection extends `@nestjs/schematics`, so `nest g service`, `nest g resource`, and friends keep working:
+
+```json
+{ "collection": "@scope/nest-graphql" }
+```
+
+```bash
+nest g regenerate
+```
+
+## Configure
+
+Export your GraphQL options once and import them in both places, so the CLI and your runtime can never disagree:
+
+```ts
+// src/graphql.config.ts
+export const schemas = {
+  default: { autoSchemaFile: 'src/schema.gql', sortSchema: true },
+  admin: { autoSchemaFile: 'src/admin.gql', include: [AdminModule] },
+};
+```
+
+```ts
+GraphQLModule.forRoot({ driver: ApolloDriver, ...schemas.default })
+```
+
+This is required, not stylistic: `forRootAsync` factories do not run in preview mode, so the CLI cannot recover your options from the module graph.
+
+## Options
+
+| Command | Effect |
+|---|---|
+| `nest g regenerate` | Regenerate the `default` schema |
+| `nest g regenerate admin` | Regenerate the `admin` schema |
+| `nest g regenerate --project api` | Target a monorepo project |
+| `nest g regenerate --dry-run` | Preview without writing |
+
+## CI
+
+`nest g` always exits 0, even on failure — a `@nestjs/cli` limitation, not a choice we made. Assert freshness with git instead:
+
+```json
+{
+  "scripts": {
+    "gql:gen": "nest g -c @scope/nest-graphql regenerate",
+    "gql:check": "pnpm gql:gen && git diff --exit-code -- '*.gql'"
+  }
+}
+```
+
+## Watch mode
+
+Not supported through `nest g` — the CLI rejects unknown flags. Use a watcher:
+
+```json
+{
+  "scripts": {
+    "gql:watch": "chokidar 'src/**/*.ts' -c 'pnpm gql:gen'"
+  }
+}
+```
+
+## Not supported
+
+Apollo Federation subgraphs. Federated schemas use a different build path (`buildSubgraphSchema`). Planned.
+````
+
+- [ ] **Step 2: Verify every command in the README appears in a passing test or the plan**
+
+Read through `README.md` and confirm each `nest g` invocation maps to behaviour covered by Tasks 8 and 9. Fix any claim that is not backed by a test.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add README.md
+git commit -m "docs: usage, configuration, and CI recipe"
+```
+
+---
+
+## Verification
+
+After Task 10, confirm end to end:
+
+```bash
+pnpm clean && pnpm install && pnpm build && pnpm test
+```
+
+Expected: build succeeds, all suites pass, and `test/parity.spec.ts` in particular reports byte-identical output.
