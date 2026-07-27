@@ -16,6 +16,7 @@
 - **`nest g` always exits 0.** `AbstractRunner.run()` calls bare `reject()` and `generate.action.ts` swallows it behind `if (error && error.message)`. Do not design any behaviour that depends on a non-zero exit code from `nest g`.
 - **`schema.json` MUST NOT set `"additionalProperties": false`.** `nest g` unconditionally injects `name`, `path`, `collection`, `project`, `skipImport`, `type`, `crud`, `language`, `sourceRoot`, `spec`, `flat`, `specFileSuffix`.
 - Package name placeholder throughout: `@scope/nest-graphql`. Substitute the real name once chosen; it affects no logic.
+- **Dependency versions are load-bearing and verified against the registry as of 2026-07-27.** `@nestjs/graphql@13.4.2` declares peers `@nestjs/core ^11.0.1` and `graphql ^16.11.0` — do **not** install `graphql@17`, it is outside the peer range. `@nestjs/schematics@11.1.0` depends on `@angular-devkit/schematics@19.2.24`; keep our devkit dependency on the same major so only one copy is installed. If `pnpm install` reports a peer conflict, report it rather than forcing a resolution.
 - Byte-parity between generated SDL and the boot path's `autoSchemaFile` output is the project's core correctness guarantee. Task 5 establishes it; no later task may regress it.
 
 ---
@@ -54,8 +55,8 @@ The critical change is deleting `"type": "module"` — see Global Constraints.
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {
-    "@angular-devkit/core": "^17.0.0",
-    "@angular-devkit/schematics": "^17.0.0"
+    "@angular-devkit/core": "^19.2.24",
+    "@angular-devkit/schematics": "^19.2.24"
   },
   "peerDependencies": {
     "@nestjs/common": ">=10",
@@ -64,14 +65,14 @@ The critical change is deleting `"type": "module"` — see Global Constraints.
     "@nestjs/schematics": ">=10"
   },
   "devDependencies": {
-    "@nestjs/common": "^10.4.0",
-    "@nestjs/core": "^10.4.0",
-    "@nestjs/graphql": "^12.2.0",
-    "@nestjs/apollo": "^12.2.0",
-    "@nestjs/platform-express": "^10.4.0",
-    "@nestjs/schematics": "^10.2.0",
-    "@apollo/server": "^4.11.0",
-    "graphql": "^16.9.0",
+    "@nestjs/common": "^11.1.28",
+    "@nestjs/core": "^11.1.28",
+    "@nestjs/graphql": "^13.4.2",
+    "@nestjs/apollo": "^13.4.2",
+    "@nestjs/platform-express": "^11.1.28",
+    "@nestjs/schematics": "^11.1.0",
+    "@apollo/server": "^5.5.1",
+    "graphql": "^16.11.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
     "@types/jest": "^29.5.13",
