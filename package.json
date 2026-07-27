@@ -12,8 +12,8 @@
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {
-    "@angular-devkit/core": "^19.2.24",
-    "@angular-devkit/schematics": "^19.2.24"
+    "@angular-devkit/core": "19.2.24",
+    "@angular-devkit/schematics": "19.2.24"
   },
   "peerDependencies": {
     "@nestjs/common": ">=10",
