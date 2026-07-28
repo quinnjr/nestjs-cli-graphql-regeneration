@@ -27,7 +27,14 @@ export function resolveConfig(distRoot: string, schemaName: string): SchemaConfi
     );
   }
 
-  const mod = require(found);
+  let mod: any;
+  try {
+    mod = require(found);
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to load GraphQL schema config at ${found}: ${cause}`);
+  }
+
   const schemas = mod.schemas ?? mod.default?.schemas;
   if (!schemas) {
     throw new Error(`${found} does not export a "schemas" object.`);

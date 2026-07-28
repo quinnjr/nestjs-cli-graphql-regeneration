@@ -14,6 +14,18 @@ module.exports.schemas = {
 };
 `;
 
+const CONFIG_JS_DEFAULT_EXPORT = `
+exports.default = {
+  schemas: {
+    default: { autoSchemaFile: 'src/schema.gql', sortSchema: true },
+  },
+};
+`;
+
+const CONFIG_JS_THROWS = `
+throw new Error('boom');
+`;
+
 describe('resolveConfig', () => {
   it('finds the config at the dist root', () => {
     const dir = scratch();
@@ -30,8 +42,14 @@ describe('resolveConfig', () => {
 
   it('lists every attempted path when the config is missing', () => {
     const dir = scratch();
-    expect(() => resolveConfig(dir, 'default')).toThrow(/graphql\.config\.js/);
-    expect(() => resolveConfig(dir, 'default')).toThrow(/src/);
+    // Assert on the actual resolved path strings, not loose substrings —
+    // both candidates independently contain "graphql.config.js" and "src",
+    // so weaker assertions would not notice if one candidate were dropped
+    // from the implementation.
+    const rootCandidate = path.join(dir, 'graphql.config.js');
+    const srcCandidate = path.join(dir, 'src', 'graphql.config.js');
+    expect(() => resolveConfig(dir, 'default')).toThrow(rootCandidate);
+    expect(() => resolveConfig(dir, 'default')).toThrow(srcCandidate);
   });
 
   it('names the missing schema key and the available ones', () => {
@@ -39,5 +57,19 @@ describe('resolveConfig', () => {
     writeFileSync(path.join(dir, 'graphql.config.js'), CONFIG_JS);
     expect(() => resolveConfig(dir, 'nope')).toThrow(/nope/);
     expect(() => resolveConfig(dir, 'nope')).toThrow(/default, admin/);
+  });
+
+  it('supports a default-export shape as well as module.exports.schemas', () => {
+    const dir = scratch();
+    writeFileSync(path.join(dir, 'graphql.config.js'), CONFIG_JS_DEFAULT_EXPORT);
+    expect(resolveConfig(dir, 'default').autoSchemaFile).toBe('src/schema.gql');
+  });
+
+  it('wraps a load-time failure with the config path and the original cause', () => {
+    const dir = scratch();
+    const configPath = path.join(dir, 'graphql.config.js');
+    writeFileSync(configPath, CONFIG_JS_THROWS);
+    expect(() => resolveConfig(dir, 'default')).toThrow(configPath);
+    expect(() => resolveConfig(dir, 'default')).toThrow(/boom/);
   });
 });
