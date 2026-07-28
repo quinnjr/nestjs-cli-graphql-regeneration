@@ -1719,6 +1719,138 @@ git commit -m "docs: usage, configuration, and CI recipe"
 
 ---
 
+### Task 11: Mercurius driver parity (Fastify)
+
+> Logically an extension of Task 5, appended rather than inserted so the ordinal-based brief extraction for Tasks 6-10 stays valid.
+
+**Why this task exists.** `src/` contains zero references to Apollo, Express, Fastify, or Mercurius — verified by grep — so the emitter is already driver- and platform-agnostic by construction. But that was never *proven*, only observed. Task 5's byte-parity proof runs against a single driver, so a driver whose `generateSchema` path diverges would go uncaught.
+
+The **platform** (Express vs Fastify) is genuinely invisible to us: the emitter uses `createApplicationContext`, never instantiates an HTTP adapter, and `GraphQLModule.onModuleInit` returns early at `if (!httpAdapter) { return; }`. So a platform swap alone exercises no new code. The **driver** is what can differ, and Mercurius is the Fastify-native driver — the true parallel to Apollo. Covering it covers the platform implicitly, since Mercurius is Fastify-only.
+
+**Files:**
+- Modify: `package.json` (devDependencies only)
+- Create: `test/fixtures/mercurius/app.module.ts`
+- Test: `test/parity-mercurius.spec.ts`
+- Modify: `README.md` — state which drivers are verified
+
+**Interfaces:**
+- Consumes: `buildSdl()` from Task 5, `readOptions()` from Task 6, the shared `RecipesResolver` fixture from Task 5.
+- Produces: nothing new in `src/`. **If this task requires a change under `src/`, stop and report it** — that would mean the emitter is not driver-agnostic after all, which is important design information, not a routine fix.
+
+**Dependency versions** (registry-verified; `@nestjs/mercurius@13.4.2` peers):
+
+```json
+"@nestjs/mercurius": "^13.4.2",
+"@nestjs/platform-fastify": "^11.1.28",
+"mercurius": "^16.0.1",
+"fastify": "^5.2.1"
+```
+
+`graphql` must stay on the `16.x` line — Mercurius peers `graphql ^16.10.0`, consistent with the existing pin. Do not bump it. `@nestjs/mercurius` also declares optional federation peers (`@apollo/subgraph`, `@mercuriusjs/gateway`, `@mercuriusjs/federation`); federation is out of scope, so unmet-peer warnings for those are expected — record them, do not install them.
+
+- [ ] **Step 1: Add the devDependencies**
+
+Add the four packages above to `devDependencies` only, then `pnpm install`. Confirm afterwards that `graphql` still resolves on `16.x` and that `@angular-devkit/schematics` still resolves to exactly one version (`19.2.24`) — an earlier task had to fix a duplicate-engine problem and it must not regress.
+
+- [ ] **Step 2: Create the Mercurius fixture**
+
+Create `test/fixtures/mercurius/app.module.ts`. It reuses the existing resolver so any SDL difference is attributable to the driver alone, not to a different schema.
+
+```ts
+import { Module } from '@nestjs/common';
+import { GraphQLModule } from '@nestjs/graphql';
+import { MercuriusDriver, MercuriusDriverConfig } from '@nestjs/mercurius';
+import { join } from 'path';
+import { RecipesResolver } from '../basic/recipes.resolver';
+
+export const MERCURIUS_SCHEMA_FILE = join(__dirname, 'boot-schema.gql');
+
+@Module({
+  imports: [
+    GraphQLModule.forRoot<MercuriusDriverConfig>({
+      driver: MercuriusDriver,
+      autoSchemaFile: MERCURIUS_SCHEMA_FILE,
+      sortSchema: true,
+    }),
+  ],
+  providers: [RecipesResolver],
+})
+export class MercuriusAppModule {}
+```
+
+- [ ] **Step 3: Write the failing parity test**
+
+Create `test/parity-mercurius.spec.ts`. Ground truth is a real Fastify boot, exactly as Task 5 does for Apollo/Express.
+
+```ts
+import 'reflect-metadata';
+import { readFileSync, rmSync, existsSync } from 'fs';
+import { buildSdl } from '../src/emitter/build';
+import { MercuriusAppModule, MERCURIUS_SCHEMA_FILE } from './fixtures/mercurius/app.module';
+
+describe('byte parity — Mercurius driver on Fastify', () => {
+  afterAll(() => {
+    if (existsSync(MERCURIUS_SCHEMA_FILE)) rmSync(MERCURIUS_SCHEMA_FILE);
+  });
+
+  it('produces output identical to a real Mercurius boot', async () => {
+    const { NestFactory } = require('@nestjs/core');
+    const { FastifyAdapter } = require('@nestjs/platform-fastify');
+
+    const app = await NestFactory.create(
+      MercuriusAppModule,
+      new FastifyAdapter(),
+      { logger: false },
+    );
+    await app.init();
+    const bootSdl = readFileSync(MERCURIUS_SCHEMA_FILE, 'utf8');
+    await app.close();
+
+    const ourSdl = await buildSdl(MercuriusAppModule, { sortSchema: true });
+
+    expect(ourSdl).toBe(bootSdl);
+  });
+
+  it('matches the Apollo fixture byte for byte, proving driver independence', async () => {
+    const { AppModule } = require('./fixtures/basic/app.module');
+
+    const apolloSdl = await buildSdl(AppModule, { sortSchema: true });
+    const mercuriusSdl = await buildSdl(MercuriusAppModule, { sortSchema: true });
+
+    // Same resolver, same options — the driver must not influence the SDL.
+    expect(mercuriusSdl).toBe(apolloSdl);
+  });
+});
+```
+
+- [ ] **Step 4: Run to verify RED, then GREEN**
+
+Run: `./node_modules/.bin/jest test/parity-mercurius.spec.ts`
+
+RED is expected before the fixture and dependencies exist. Once they do, both tests must pass.
+
+**If parity fails, do not relax the assertion.** Diff the two strings and report exactly what differs. A driver-dependent SDL difference is a real finding about the design and changes what this package can claim.
+
+- [ ] **Step 5: Run the full suite**
+
+Run: `pnpm test`
+Expected: all prior tests still pass, output pristine. The Apollo parity test from Task 5 must not regress.
+
+- [ ] **Step 6: Update the README's supported-drivers statement**
+
+Replace any Apollo-specific phrasing with an explicit statement of what is verified:
+
+> Works with any `@nestjs/graphql` driver. Byte-parity is verified in CI against **Apollo** (on Express) and **Mercurius** (on Fastify). The emitter never instantiates an HTTP adapter, so the platform is irrelevant to schema generation.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add package.json pnpm-lock.yaml test/fixtures/mercurius test/parity-mercurius.spec.ts README.md
+git commit -m "test: prove byte parity against the Mercurius driver on Fastify"
+```
+
+---
+
 ## Verification
 
 After Task 10, confirm end to end:
