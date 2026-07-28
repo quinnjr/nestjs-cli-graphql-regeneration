@@ -57,7 +57,7 @@ describe('regenerate schematic registration', () => {
       {
         name: 'default',
         path: 'src',
-        collection: '@scope/nest-graphql',
+        collection: 'nestjs-graphql-regenerate',
         project: 'api',
         skipImport: false,
         type: 'graphql',

@@ -3,7 +3,7 @@
 **Date:** 2026-07-27
 **Status:** Approved design, pending implementation plan
 
-> `@scope/nest-graphql` throughout this document is a placeholder. The published package name is an open decision and does not affect any design choice below.
+> The package is published as `nestjs-graphql-regenerate`. This document originally carried a `@scope/…` placeholder while the name was undecided; the name affects no design choice below.
 
 ## Problem
 
@@ -42,7 +42,7 @@ Demand is established upstream and unmet: [nestjs/graphql#1587](https://github.c
 The chosen vehicle is an external schematics collection, invoked through the one extension point the CLI does expose:
 
 ```
-nest g -c @scope/nest-graphql regenerate
+nest g -c nestjs-graphql-regenerate regenerate
 ```
 
 `CollectionFactory.create()` routes any non-`@nestjs/schematics` collection to `CustomCollection`, which resolves it via `new NodeWorkflow(process.cwd(), {})` — so the package must be installed in the target project's `node_modules`.
@@ -56,12 +56,12 @@ nest g -c @scope/nest-graphql regenerate
 means a user *may* optionally repoint their default collection in `nest-cli.json`:
 
 ```json
-{ "collection": "@scope/nest-graphql" }
+{ "collection": "nestjs-graphql-regenerate" }
 ```
 
 and then get `nest g regenerate` with no `-c`, while `nest g resource`, `nest g service`, etc. continue to work through the inherited chain.
 
-> **Documentation stance:** the README leads with the explicit `-c @scope/nest-graphql` form. The `nest-cli.json` override is presented as an optional convenience, not the happy path.
+> **Documentation stance:** the README leads with the explicit `-c nestjs-graphql-regenerate` form. The `nest-cli.json` override is presented as an optional convenience, not the happy path.
 
 ### D2 — Discovery: preview-mode boot
 
@@ -94,10 +94,10 @@ The feature set must therefore ride on existing flags:
 Resulting surface:
 
 ```
-nest g -c @scope/nest-graphql regenerate                 # write default schema
-nest g -c @scope/nest-graphql regenerate admin           # write named schema
-nest g -c @scope/nest-graphql regenerate --project api   # monorepo project
-nest g -c @scope/nest-graphql regenerate --dry-run       # CI check; exit 1 on drift
+nest g -c nestjs-graphql-regenerate regenerate                 # write default schema
+nest g -c nestjs-graphql-regenerate regenerate admin           # write named schema
+nest g -c nestjs-graphql-regenerate regenerate --project api   # monorepo project
+nest g -c nestjs-graphql-regenerate regenerate --dry-run       # CI check; exit 1 on drift
 ```
 
 `--dry-run` works as a human-facing preview: the schematic writes through the schematics `Tree`, so dry-run reports `UPDATE src/schema.gql` without committing.
@@ -109,7 +109,7 @@ Drift detection therefore runs **out of band**, using the tool every repository 
 ```json
 {
   "scripts": {
-    "gql:gen": "nest g -c @scope/nest-graphql regenerate",
+    "gql:gen": "nest g -c nestjs-graphql-regenerate regenerate",
     "gql:check": "pnpm gql:gen && git diff --exit-code -- '*.gql'"
   }
 }
@@ -212,7 +212,7 @@ GraphQLModule.forRoot({ driver: ApolloDriver, ...schemas.default })
 
 This is load-bearing, not stylistic. **`forRootAsync` factories do not execute under preview mode**, so the tool cannot recover effective `GqlModuleOptions` from the module graph. The shared object is the only reliable channel for `autoSchemaFile`, `sortSchema`, `include`, and `buildSchemaOptions`.
 
-The `[name]` positional selects the key: `nest g -c @scope/nest-graphql regenerate admin` resolves `schemas.admin`. Absent a name, `schemas.default` is used.
+The `[name]` positional selects the key: `nest g -c nestjs-graphql-regenerate regenerate admin` resolves `schemas.admin`. Absent a name, `schemas.default` is used.
 
 ## Monorepo resolution
 

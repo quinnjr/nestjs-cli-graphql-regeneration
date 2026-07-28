@@ -15,7 +15,7 @@
 - **Resolve the user's Nest packages from the user's project**, via `require.resolve(id, { paths: [projectRoot] })`. Never from this package's own `node_modules`.
 - **`nest g` always exits 0.** `AbstractRunner.run()` calls bare `reject()` and `generate.action.ts` swallows it behind `if (error && error.message)`. Do not design any behaviour that depends on a non-zero exit code from `nest g`.
 - **`schema.json` MUST NOT set `"additionalProperties": false`.** `nest g` unconditionally injects `name`, `path`, `collection`, `project`, `skipImport`, `type`, `crud`, `language`, `sourceRoot`, `spec`, `flat`, `specFileSuffix`.
-- Package name placeholder throughout: `@scope/nest-graphql`. Substitute the real name once chosen; it affects no logic.
+- Package name: `nestjs-graphql-regenerate` (unscoped). This plan was written against a `@scope/…` placeholder; the name affects no logic.
 - **Dependency versions are load-bearing and verified against the registry as of 2026-07-27.** `@nestjs/graphql@13.4.2` declares peers `@nestjs/core ^11.0.1` and `graphql ^16.11.0` — do **not** install `graphql@17`, it is outside the peer range. If `pnpm install` reports a peer conflict, report it rather than forcing a resolution.
 - **`@angular-devkit/core` and `@angular-devkit/schematics` are pinned exactly to `19.2.24`, with no caret.** `@nestjs/schematics@11.1.0` depends on that exact version. A caret floats to newer patches and installs a *second* copy of the schematics engine alongside it. Two engine copies in one process mean two distinct `SchematicsException`, `Tree`, and collection-description classes, so `instanceof` checks across the boundary silently fail — which breaks collection loading through `extends`, exactly what this package relies on. Verify with `pnpm why @angular-devkit/schematics` that only one version resolves.
 - Byte-parity between generated SDL and the boot path's `autoSchemaFile` output is the project's core correctness guarantee. Task 5 establishes it; no later task may regress it.
@@ -55,7 +55,7 @@ The critical change is deleting `"type": "module"` — see Global Constraints.
 
 ```json
 {
-  "name": "@scope/nest-graphql",
+  "name": "nestjs-graphql-regenerate",
   "version": "0.1.0",
   "description": "Regenerate a NestJS code-first GraphQL schema without booting the app",
   "license": "MIT",
@@ -163,7 +163,7 @@ import { PACKAGE_NAME } from '../src/version';
 
 describe('toolchain', () => {
   it('compiles and exports a constant', () => {
-    expect(PACKAGE_NAME).toBe('@scope/nest-graphql');
+    expect(PACKAGE_NAME).toBe('nestjs-graphql-regenerate');
   });
 });
 ```
@@ -178,7 +178,7 @@ Expected: FAIL — `Cannot find module '../src/version'`
 Create `src/version.ts`:
 
 ```ts
-export const PACKAGE_NAME = '@scope/nest-graphql';
+export const PACKAGE_NAME = 'nestjs-graphql-regenerate';
 ```
 
 - [ ] **Step 7: Run test and build to verify both pass**
@@ -231,7 +231,7 @@ describe('regenerate schematic registration', () => {
       {
         name: 'default',
         path: 'src',
-        collection: '@scope/nest-graphql',
+        collection: 'nestjs-graphql-regenerate',
         project: 'api',
         skipImport: false,
         type: 'graphql',
@@ -1577,26 +1577,26 @@ git commit -m "feat: wire regenerate schematic end to end"
 - [ ] **Step 1: Write `README.md`**
 
 ````markdown
-# @scope/nest-graphql
+# nestjs-graphql-regenerate
 
 Regenerate a NestJS code-first GraphQL schema without booting your app — no database, no Redis, no secrets.
 
 ## Install
 
 ```bash
-pnpm add -D @scope/nest-graphql
+pnpm add -D nestjs-graphql-regenerate
 ```
 
 ## Use
 
 ```bash
-nest g -c @scope/nest-graphql regenerate
+nest g -c nestjs-graphql-regenerate regenerate
 ```
 
 Optionally set the collection as your default in `nest-cli.json` to drop the `-c` flag. The collection extends `@nestjs/schematics`, so `nest g service`, `nest g resource`, and friends keep working:
 
 ```json
-{ "collection": "@scope/nest-graphql" }
+{ "collection": "nestjs-graphql-regenerate" }
 ```
 
 ```bash
@@ -1637,7 +1637,7 @@ This is required, not stylistic: `forRootAsync` factories do not run in preview 
 ```json
 {
   "scripts": {
-    "gql:gen": "nest g -c @scope/nest-graphql regenerate",
+    "gql:gen": "nest g -c nestjs-graphql-regenerate regenerate",
     "gql:check": "pnpm gql:gen && git diff --exit-code -- '*.gql'"
   }
 }
