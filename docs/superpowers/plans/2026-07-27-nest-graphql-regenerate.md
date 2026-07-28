@@ -19,6 +19,16 @@
 - **Dependency versions are load-bearing and verified against the registry as of 2026-07-27.** `@nestjs/graphql@13.4.2` declares peers `@nestjs/core ^11.0.1` and `graphql ^16.11.0` — do **not** install `graphql@17`, it is outside the peer range. If `pnpm install` reports a peer conflict, report it rather than forcing a resolution.
 - **`@angular-devkit/core` and `@angular-devkit/schematics` are pinned exactly to `19.2.24`, with no caret.** `@nestjs/schematics@11.1.0` depends on that exact version. A caret floats to newer patches and installs a *second* copy of the schematics engine alongside it. Two engine copies in one process mean two distinct `SchematicsException`, `Tree`, and collection-description classes, so `instanceof` checks across the boundary silently fail — which breaks collection loading through `extends`, exactly what this package relies on. Verify with `pnpm why @angular-devkit/schematics` that only one version resolves.
 - Byte-parity between generated SDL and the boot path's `autoSchemaFile` output is the project's core correctness guarantee. Task 5 establishes it; no later task may regress it.
+- **Deep imports into `@nestjs/graphql` MUST carry the `.js` extension.** That package's exports map is `{ "./*": "./*" }` — literal, with no extension resolution. Jest's resolver accepts an extensionless deep specifier; **real Node does not**, and the emitter runs in a spawned `node` process. This is not theoretical: the whole suite was green while the product path was broken by exactly this, until `test/spawn.spec.ts` became the first test to run compiled output in a real child process. Verified per-specifier:
+
+  | specifier | real node |
+  |---|---|
+  | `@nestjs/graphql/dist/graphql.constants` | **FAIL** |
+  | `@nestjs/graphql/dist/graphql.constants.js` | OK |
+  | `@nestjs/graphql/dist/utils` | **FAIL** |
+  | `@nestjs/core/inspector`, `@nestjs/core`, `@nestjs/common`, `@nestjs/graphql` | OK |
+
+  `@nestjs/core` is unaffected because its exports map differs. Before adding any deep import, check it with `node -e "require('<specifier>')"` — never rely on a passing Jest run as evidence that a specifier resolves.
 
 ---
 
