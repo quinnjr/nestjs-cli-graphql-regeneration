@@ -10,6 +10,8 @@ import {
 import { tmpdir } from 'os';
 import * as path from 'path';
 import { spawnEmitter } from '../src/emitter/spawn';
+import { resolveDistFile } from '../src/config/dist-layout';
+import { APP_MODULE_BASENAME } from '../src/config/resolve';
 
 // dist/emitter/child.js is the real compiled entry spawn.ts locates at
 // runtime (see spawn.ts's resolveChildEntry). A couple of tests below
@@ -53,6 +55,69 @@ describe('spawnEmitter', () => {
     expect(result.ok).toBe(true);
     expect(result.sdl).toContain('type Recipe');
     expect(result.outFile).toBe('src/schema.gql');
+  });
+
+  it('is not confused by user code logging to stdout before the payload', async () => {
+    // The failure this protects against is silent and total: the emitter
+    // shares stdout with `require(appModulePath)` and the whole preview boot,
+    // so one config banner, dotenv debug line or ORM deprecation notice at
+    // require time used to turn a correct schema into
+    // "Emitter produced no usable output."
+    const dir = tempDir('gqlspawn-noisy-');
+    const distRoot = path.join(dir, 'dist');
+    mkdirSync(distRoot, { recursive: true });
+    cpSync(path.join(__dirname, 'fixtures-dist'), distRoot, { recursive: true });
+    writeFileSync(path.join(distRoot, 'graphql.config.js'), GRAPHQL_CONFIG_JS);
+
+    // A module that chatters on stdout at require time, then re-exports the
+    // real app module — the exact shape of a noisy dependency.
+    const noisyModulePath = path.join(distRoot, 'noisy-app.module.js');
+    writeFileSync(
+      noisyModulePath,
+      `console.log('[db] connected to postgres://localhost:5432');\n` +
+        `console.log(JSON.stringify({ ok: true, sdl: 'IMPOSTOR', outFile: 'nope.gql' }));\n` +
+        `process.stdout.write('trailing chatter with no newline');\n` +
+        `module.exports = require('./basic/app.module');\n`,
+    );
+
+    const result = await spawnEmitter({
+      projectRoot: process.cwd(),
+      distRoot,
+      appModulePath: noisyModulePath,
+      schemaName: 'default',
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.sdl).toContain('type Recipe');
+    // Specifically: a well-formed impostor payload on stdout must not be able
+    // to impersonate the real one.
+    expect(result.sdl).not.toContain('IMPOSTOR');
+    expect(result.outFile).toBe('src/schema.gql');
+  });
+
+  it('composes the nested dist/src/ layout: config and app module both under src/', async () => {
+    const dir = tempDir('gqlspawn-nested-');
+    const distRoot = path.join(dir, 'dist');
+    const nested = path.join(distRoot, 'src');
+    mkdirSync(nested, { recursive: true });
+    cpSync(path.join(__dirname, 'fixtures-dist'), nested, { recursive: true });
+    // Candidate #2 for the config...
+    writeFileSync(path.join(nested, 'graphql.config.js'), GRAPHQL_CONFIG_JS);
+    // ...and candidate #2 for the app module, resolved through the same helper
+    // regenerate/index.ts uses, so this proves the two halves agree.
+    writeFileSync(
+      path.join(nested, 'app.module.js'),
+      `module.exports = require('./basic/app.module');\n`,
+    );
+
+    const result = await spawnEmitter({
+      projectRoot: process.cwd(),
+      distRoot,
+      appModulePath: resolveDistFile(distRoot, APP_MODULE_BASENAME),
+      schemaName: 'default',
+    });
+
+    expect(result.sdl).toContain('type Recipe');
   });
 
   it('surfaces the child error message on failure', async () => {
@@ -115,6 +180,43 @@ describe('spawnEmitter', () => {
 
     expect(caught).toBeDefined();
     expect(caught!.message).toBe(bigMessage);
+  });
+
+  it('attaches the child\'s stack to the rejected error', async () => {
+    // EmitFailure has carried `stack` since the protocol was written and the
+    // child has always populated it, but the parent used to drop it on the
+    // floor -- discarding the only stack that describes what actually failed
+    // inside the child's preview boot. The large-payload test above exists
+    // precisely to keep a deep Nest DI stack intact in transit; that is
+    // pointless if it is then thrown away on arrival.
+    const dir = tempDir('gqlspawn-stack-');
+    const distRoot = path.join(dir, 'dist');
+    mkdirSync(distRoot, { recursive: true });
+    writeFileSync(path.join(distRoot, 'graphql.config.js'), GRAPHQL_CONFIG_JS);
+
+    const throwingModulePath = path.join(distRoot, 'thrower.js');
+    writeFileSync(
+      throwingModulePath,
+      `function deepFrameForTheStack() { throw new Error('boom from the child'); }\n` +
+        `deepFrameForTheStack();\n`,
+    );
+
+    let caught: Error | undefined;
+    try {
+      await spawnEmitter({
+        projectRoot: process.cwd(),
+        distRoot,
+        appModulePath: throwingModulePath,
+        schemaName: 'default',
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+
+    expect(caught).toBeDefined();
+    expect(caught!.message).toBe('boom from the child');
+    expect(caught!.stack).toContain('deepFrameForTheStack');
+    expect(caught!.stack).toContain('thrower.js');
   });
 
   it('surfaces a clear error when the child dies without producing usable output', async () => {
@@ -208,7 +310,16 @@ describe('spawnEmitter', () => {
 
   it('surfaces a clear error for parseable-but-wrong-shaped child output', async () => {
     const backup = readFileSync(REAL_CHILD_JS, 'utf8');
-    writeFileSync(REAL_CHILD_JS, `process.stdout.write(JSON.stringify({ unexpected: 'shape' }));\n`);
+    // Writes to the dedicated payload descriptor, not stdout: the result
+    // payload moved off stdout so a `console.log` in user code can no longer
+    // corrupt it (see src/emitter/protocol.ts). A stub emulating the child
+    // has to emulate the protocol it actually speaks — on stdout this blob
+    // would now be indistinguishable from ordinary user output, which is
+    // precisely the property the move buys.
+    writeFileSync(
+      REAL_CHILD_JS,
+      `require('fs').writeSync(3, JSON.stringify({ unexpected: 'shape' }));\n`,
+    );
     try {
       let caught: Error | undefined;
       try {

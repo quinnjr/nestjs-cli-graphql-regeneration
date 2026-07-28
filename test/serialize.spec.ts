@@ -10,7 +10,7 @@ function schemaWithFields(...names: string[]) {
 describe('serialize', () => {
   it('prefixes the @nestjs/graphql SDL header', async () => {
     const out = await serialize(schemaWithFields('a'), {});
-    const header = require('@nestjs/graphql/dist/graphql.constants').GRAPHQL_SDL_FILE_HEADER;
+    const header = require('@nestjs/graphql/dist/graphql.constants.js').GRAPHQL_SDL_FILE_HEADER;
     expect(out.startsWith(header)).toBe(true);
   });
 
@@ -25,7 +25,7 @@ describe('serialize', () => {
   });
 
   it('appends the trailing newline marker when asked', async () => {
-    const end = require('@nestjs/graphql/dist/graphql.constants').GRAPHQL_SDL_FILE_END;
+    const end = require('@nestjs/graphql/dist/graphql.constants.js').GRAPHQL_SDL_FILE_END;
     const out = await serialize(schemaWithFields('a'), { addNewlineAtEnd: true });
     expect(out.endsWith(end)).toBe(true);
   });

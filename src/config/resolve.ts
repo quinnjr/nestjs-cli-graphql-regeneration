@@ -1,28 +1,112 @@
-import { existsSync } from 'fs';
-import * as path from 'path';
+import type { GqlModuleOptions } from '@nestjs/graphql';
+import { distCandidates, findDistFile } from './dist-layout';
 
 export const CONFIG_BASENAME = 'graphql.config.js';
+export const APP_MODULE_BASENAME = 'app.module.js';
 
-export interface SchemaConfig {
-  autoSchemaFile: string;
-  sortSchema?: boolean;
+/**
+ * The subset of `GqlModuleOptions` that influences the SDL `autoSchemaFile`
+ * writes at boot.
+ *
+ * Deliberately expressed as a `Pick<>` off `@nestjs/graphql`'s own interface
+ * rather than as a hand-written shape. A hand-written copy is how this
+ * package ended up typing `autoSchemaFile` as `string` when upstream accepts
+ * `boolean | string | SchemaFileConfig`, and how `transformAutoSchemaFile`
+ * went missing entirely — divergences the compiler could not see because a
+ * config loaded through `require()` arrives as `any`. Tying the type to
+ * upstream means the *next* option @nestjs/graphql adds shows up as a
+ * compile error here rather than as a silent byte difference.
+ */
+export type SchemaConfig = Pick<
+  GqlModuleOptions,
+  | 'autoSchemaFile'
+  | 'sortSchema'
+  | 'buildSchemaOptions'
+  | 'transformSchema'
+  | 'transformAutoSchemaFile'
+  | 'include'
+> & {
+  /**
+   * Legacy top-level alias for `buildSchemaOptions.addNewlineAtEnd`.
+   *
+   * Upstream declares `addNewlineAtEnd` on `BuildSchemaOptions` only, and
+   * `GraphQLSchemaBuilder.generateSchema` reads it off the merged
+   * `buildSchemaOptions`. Earlier versions of this package read it at the top
+   * level, so it stays supported as a fallback — but the nested form is
+   * authoritative and wins whenever both are present.
+   */
   addNewlineAtEnd?: boolean;
-  buildSchemaOptions?: Record<string, unknown>;
-  transformSchema?: (schema: any) => any;
-  include?: Function[];
+};
+
+/**
+ * Compile-time exhaustiveness latch. `Record<keyof SchemaConfig, true>`
+ * rejects both a missing key (a `SchemaConfig` field with no runtime entry)
+ * and an extra one (a runtime entry naming a field that no longer exists), so
+ * `SCHEMA_CONFIG_FIELDS` cannot drift from the type. `test/parity-config.spec.ts`
+ * asserts every entry here has a boot-vs-ours byte-parity case.
+ */
+const SCHEMA_CONFIG_FIELD_SET: Record<keyof SchemaConfig, true> = {
+  autoSchemaFile: true,
+  sortSchema: true,
+  buildSchemaOptions: true,
+  transformSchema: true,
+  transformAutoSchemaFile: true,
+  include: true,
+  addNewlineAtEnd: true,
+};
+
+export const SCHEMA_CONFIG_FIELDS = Object.keys(
+  SCHEMA_CONFIG_FIELD_SET,
+) as (keyof SchemaConfig)[];
+
+/**
+ * Where the SDL should be written, resolved exactly as
+ * `@nestjs/graphql`'s `getPathForAutoSchemaFile` resolves it:
+ * a string is the path; an object contributes its `path`; anything else
+ * (including `true`, which tells the boot path to build the schema in memory
+ * without writing it) names no file at all.
+ *
+ * Upstream treats "names no file" as "skip the write". This package exists
+ * *to* write the file, so the same condition is an error — a clear one,
+ * rather than the `/true` and `/[object Object]` junk paths that a naive
+ * string coercion produced.
+ */
+export function resolveOutFile(
+  autoSchemaFile: SchemaConfig['autoSchemaFile'],
+  schemaName: string,
+): string {
+  let resolved: string | null = null;
+
+  if (typeof autoSchemaFile === 'string') {
+    resolved = autoSchemaFile;
+  } else if (autoSchemaFile !== null && typeof autoSchemaFile === 'object') {
+    const { path: configuredPath } = autoSchemaFile;
+    if (typeof configuredPath === 'string') resolved = configuredPath;
+  }
+
+  if (!resolved) {
+    throw new Error(
+      `Schema "${schemaName}" does not say where to write its SDL: "autoSchemaFile" is ` +
+        `${JSON.stringify(autoSchemaFile) ?? String(autoSchemaFile)}, which names no file. ` +
+        `@nestjs/graphql accepts boolean | string | { path }, but only a string or an ` +
+        `object with a non-empty "path" identifies an output file — "true" means "build ` +
+        `the schema in memory and write nothing", which leaves this schematic with ` +
+        `nothing to do. Set autoSchemaFile to a path, e.g. ` +
+        `autoSchemaFile: 'src/schema.gql'.`,
+    );
+  }
+
+  return resolved;
 }
 
 export function resolveConfig(distRoot: string, schemaName: string): SchemaConfig {
-  const candidates = [
-    path.join(distRoot, CONFIG_BASENAME),
-    path.join(distRoot, 'src', CONFIG_BASENAME),
-  ];
-
-  const found = candidates.find((c) => existsSync(c));
+  const found = findDistFile(distRoot, CONFIG_BASENAME);
   if (!found) {
     throw new Error(
       `Could not find a compiled ${CONFIG_BASENAME}. Looked in:\n` +
-        candidates.map((c) => `  - ${c}`).join('\n') +
+        distCandidates(distRoot, CONFIG_BASENAME)
+          .map((c) => `  - ${c}`)
+          .join('\n') +
         `\nRun "nest build" first, and export a "schemas" object from graphql.config.ts.`,
     );
   }
@@ -31,8 +115,16 @@ export function resolveConfig(distRoot: string, schemaName: string): SchemaConfi
   try {
     mod = require(found);
   } catch (err) {
-    const cause = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to load GraphQL schema config at ${found}: ${cause}`);
+    // Preserve the original error as `cause` rather than flattening it to a
+    // message fragment: the message alone drops the stack that says *which*
+    // line of the user's config blew up. Same technique, and same lib target,
+    // as ../emitter/preview.ts's augmentPreviewBootError.
+    const original = err instanceof Error ? err : new Error(String(err));
+    const augmented = new Error(
+      `Failed to load GraphQL schema config at ${found}: ${original.message}`,
+    );
+    (augmented as Error & { cause?: unknown }).cause = original;
+    throw augmented;
   }
 
   const schemas = mod.schemas ?? mod.default?.schemas;

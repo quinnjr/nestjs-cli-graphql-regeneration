@@ -1,9 +1,9 @@
 import { spawn } from 'child_process';
 import { existsSync } from 'fs';
 import * as path from 'path';
-import { EmitRequest, EmitSuccess, EmitFailure } from './protocol';
+import { EmitRequest, EmitSuccess, EmitFailure, PAYLOAD_FD } from './protocol';
 
-export { EmitRequest, EmitSuccess, EmitFailure };
+export { EmitRequest, EmitSuccess, EmitFailure, PAYLOAD_FD };
 
 // The child always loads compiled JavaScript, so child.js must exist as a real
 // file on disk. Post-build, this module runs as dist/emitter/spawn.js with
@@ -53,7 +53,13 @@ export function spawnEmitter(req: EmitRequest): Promise<EmitSuccess> {
       ['-r', 'reflect-metadata', childEntry, JSON.stringify(req)],
       {
         cwd: req.projectRoot,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        // stdin ignored; stdout *inherited*; stderr piped; payload on its own
+        // descriptor. Inheriting stdout is the point of the dedicated
+        // descriptor (see ./protocol.ts): the child shares stdout with the
+        // user's app module and preview boot, so anything it logs now reaches
+        // the terminal instead of corrupting — and being swallowed by — the
+        // result payload.
+        stdio: ['ignore', 'inherit', 'pipe', 'pipe'],
         env: {
           ...process.env,
           NODE_PATH: path.join(req.projectRoot, 'node_modules'),
@@ -71,27 +77,41 @@ export function spawnEmitter(req: EmitRequest): Promise<EmitSuccess> {
       reject(new Error(`Failed to spawn emitter child process: ${err.message}`));
     });
 
-    let stdout = '';
+    let payload = '';
     let stderr = '';
-    child.stdout.on('data', (d) => (stdout += d.toString()));
-    child.stderr.on('data', (d) => (stderr += d.toString()));
 
+    const payloadStream = child.stdio[PAYLOAD_FD] as NodeJS.ReadableStream | undefined;
+    if (payloadStream) payloadStream.on('data', (d) => (payload += d.toString()));
+
+    const stderrStream = child.stderr;
+    if (stderrStream) stderrStream.on('data', (d) => (stderr += d.toString()));
+
+    // 'close' (not 'exit') fires only once every piped stdio stream has also
+    // closed, so the payload is complete by the time this runs.
     child.on('close', () => {
       let parsed: unknown;
       try {
-        parsed = JSON.parse(stdout.trim());
+        parsed = JSON.parse(payload.trim());
       } catch {
-        reject(new Error(`Emitter produced no usable output.\n${stderr || stdout}`));
+        reject(new Error(`Emitter produced no usable output.\n${stderr}`));
         return;
       }
       if (!isEmitResult(parsed)) {
         reject(
-          new Error(`Emitter produced unexpected output: ${stdout.trim()}\n${stderr}`),
+          new Error(`Emitter produced unexpected output: ${payload.trim()}\n${stderr}`),
         );
         return;
       }
-      if (parsed.ok) resolve(parsed);
-      else reject(new Error(parsed.message));
+      if (parsed.ok) {
+        resolve(parsed);
+        return;
+      }
+      // The child reports its stack; keep it. A stack synthesised here points
+      // at this `close` handler, which says nothing about what went wrong
+      // inside the child's preview boot.
+      const error = new Error(parsed.message);
+      if (parsed.stack) error.stack = parsed.stack;
+      reject(error);
     });
   });
 }

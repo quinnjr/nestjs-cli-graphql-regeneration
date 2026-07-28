@@ -1,8 +1,45 @@
 import { Rule, SchematicContext, SchematicsException, Tree } from '@angular-devkit/schematics';
 import * as path from 'path';
 import { resolveProject, ResolvedProject } from '../config/project';
+import { APP_MODULE_BASENAME } from '../config/resolve';
+import { resolveDistFile } from '../config/dist-layout';
 import { spawnEmitter } from '../emitter/spawn';
 import { buildProject } from './build-project';
+
+/**
+ * Turn the emitter's `outFile` — the user's `autoSchemaFile` value, verbatim —
+ * into a schematics `Tree` path.
+ *
+ * A `Tree` is rooted at the project, so its paths are always project-relative
+ * and absolute-looking. `autoSchemaFile`, meanwhile, is very often a real
+ * absolute path: `join(process.cwd(), 'src/schema.gql')` is what the official
+ * NestJS code-first docs use, and what this repo's own fixtures use. Simply
+ * prefixing a `/` turned that into a Tree path mirroring the machine's full
+ * directory layout — so the schematic committed a brand new file in a deep
+ * junk directory, never updated the real schema, and (because `tree.read()`
+ * of that path was always `null`) could never report "up to date" either.
+ */
+function toTreePath(projectRoot: string, outFile: string): string {
+  const absolute = path.resolve(projectRoot, outFile);
+  const relative = path.relative(projectRoot, absolute);
+
+  if (
+    relative === '' ||
+    relative === '..' ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    throw new SchematicsException(
+      `The configured schema output path "${outFile}" resolves to "${absolute}", which is ` +
+        `outside the project root "${projectRoot}". A schematic can only write inside the ` +
+        `project it is run against. Point "autoSchemaFile" at a path inside the project ` +
+        `(e.g. 'src/schema.gql', or join(process.cwd(), 'src/schema.gql')).`,
+    );
+  }
+
+  // Tree paths are POSIX-style regardless of host platform.
+  return '/' + relative.split(path.sep).join('/');
+}
 
 export interface RegenerateOptions {
   name?: string;
@@ -44,14 +81,20 @@ export function regenerate(options: RegenerateOptions): Rule {
     context.logger.info(`Building project${options.project ? ` "${options.project}"` : ''}...`);
     await buildProject(projectRoot, options.project);
 
+    const distRoot = path.join(projectRoot, project.distRoot);
+
     const result = await spawnEmitter({
       projectRoot,
-      distRoot: path.join(projectRoot, project.distRoot),
-      appModulePath: path.join(projectRoot, project.distRoot, 'app.module.js'),
+      distRoot,
+      // Probed the same way, through the same helper, as the compiled
+      // graphql.config.js: both files answer one question — "flat or nested
+      // `src/` build output?" — and answering it differently in two places is
+      // what made the documented `dist/src/` layout impossible end to end.
+      appModulePath: resolveDistFile(distRoot, APP_MODULE_BASENAME),
       schemaName,
     });
 
-    const target = '/' + result.outFile.replace(/^\.?\//, '');
+    const target = toTreePath(projectRoot, result.outFile);
     const existing = tree.read(target);
 
     if (existing && existing.toString('utf8') === result.sdl) {

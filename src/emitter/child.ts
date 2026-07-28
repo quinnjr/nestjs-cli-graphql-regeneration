@@ -1,8 +1,8 @@
-import { existsSync } from 'fs';
+import { existsSync, writeSync } from 'fs';
 import * as path from 'path';
-import { buildSdl } from './build';
-import { resolveConfig } from '../config/resolve';
-import { EmitRequest } from './protocol';
+import { buildSdl, buildSdlOptionsFrom } from './build';
+import { resolveConfig, resolveOutFile } from '../config/resolve';
+import { EmitFailure, EmitRequest, EmitSuccess, PAYLOAD_FD } from './protocol';
 
 function loadDotEnv(projectRoot: string): void {
   const envPath = path.join(projectRoot, '.env');
@@ -56,6 +56,32 @@ function warnIfVersionIsolationDiverges(projectRoot: string): void {
   }
 }
 
+/**
+ * Write the result payload to the dedicated payload descriptor (see
+ * ../emitter/protocol.ts) rather than stdout.
+ *
+ * `writeSync` in a loop, not a stream: the descriptor is a plain inherited
+ * pipe, and this has to complete before the process ends. The previous
+ * stdout-based implementation had to lean on `process.exitCode` (rather than
+ * `process.exit()`) so an asynchronous multi-megabyte write could drain — a
+ * synchronous write removes that hazard entirely instead of managing it.
+ * Partial writes are looped over because `write(2)` may return short.
+ */
+function writePayload(payload: EmitSuccess | EmitFailure): void {
+  const buf = Buffer.from(JSON.stringify(payload), 'utf8');
+  let offset = 0;
+  while (offset < buf.length) {
+    try {
+      offset += writeSync(PAYLOAD_FD, buf, offset, buf.length - offset);
+    } catch (err) {
+      // The descriptor is blocking when spawned by ../emitter/spawn.ts, but
+      // do not assume it: retry rather than lose the payload.
+      if ((err as NodeJS.ErrnoException).code === 'EAGAIN') continue;
+      throw err;
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const req: EmitRequest = JSON.parse(process.argv[2]);
 
@@ -63,33 +89,31 @@ async function main(): Promise<void> {
   warnIfVersionIsolationDiverges(req.projectRoot);
 
   const config = resolveConfig(req.distRoot, req.schemaName);
+
+  // Resolve the output path *before* the (far slower, far more failure-prone)
+  // preview boot: a config that names no output file can never produce a
+  // useful result, so say so immediately instead of after a full build.
+  const outFile = resolveOutFile(config.autoSchemaFile, req.schemaName);
+
   const mod = require(req.appModulePath);
   const AppModule = mod.AppModule ?? mod.default;
   if (!AppModule) {
     throw new Error(`${req.appModulePath} does not export AppModule.`);
   }
 
-  const sdl = await buildSdl(AppModule, {
-    sortSchema: config.sortSchema,
-    addNewlineAtEnd: config.addNewlineAtEnd,
-    transformSchema: config.transformSchema,
-    buildSchemaOptions: config.buildSchemaOptions,
-    include: config.include,
-  });
+  const sdl = await buildSdl(AppModule, buildSdlOptionsFrom(config));
 
-  process.stdout.write(
-    JSON.stringify({ ok: true, sdl, outFile: config.autoSchemaFile }),
-  );
+  writePayload({ ok: true, sdl, outFile });
 }
 
 main().catch((err: Error) => {
-  // Node's stdout is asynchronous when piped (which is how spawn.ts connects
-  // it). process.exit() does not wait for pending writes to flush, so calling
-  // it immediately after this write can truncate a large payload — very
-  // plausible for a deep Nest DI failure's err.stack. Setting exitCode and
-  // letting the process end on its own lets the write flush first.
-  process.stdout.write(
-    JSON.stringify({ ok: false, message: err.message, stack: err.stack }),
-  );
+  try {
+    writePayload({ ok: false, message: err.message, stack: err.stack });
+  } catch {
+    // The payload descriptor is unavailable (e.g. this entry was run by hand
+    // rather than by ../emitter/spawn.ts). Losing the diagnostic entirely is
+    // strictly worse than printing it.
+    process.stderr.write(`[nest-graphql] emitter failed: ${err.stack ?? err.message}\n`);
+  }
   process.exitCode = 1;
 });

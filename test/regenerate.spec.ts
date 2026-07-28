@@ -144,6 +144,107 @@ describe('regenerate', () => {
       runner.runSchematic('regenerate', { name: 'default', project: 'ghost' }, tree),
     ).rejects.toThrow(/Unknown project "ghost"/);
   });
+
+  it('probes the nested dist/src/ layout for the app module, like the config lookup does', async () => {
+    const { spawnEmitter } = require('../src/emitter/spawn');
+    // The dual-candidate probe is a real filesystem question, so give it a
+    // real file to find. `dist/` is this package's own (gitignored) build
+    // output and `process.cwd()` is the repo root, which is exactly the
+    // projectRoot the Rule uses.
+    const nestedDir = path.join(process.cwd(), 'dist', 'src');
+    const nestedAppModule = path.join(nestedDir, 'app.module.js');
+    const preExisting = fs.existsSync(nestedDir);
+    fs.mkdirSync(nestedDir, { recursive: true });
+    fs.writeFileSync(nestedAppModule, '// stub for the nested-layout probe\n');
+
+    try {
+      const runner = new SchematicTestRunner('nest-graphql', collectionPath);
+      await runner.runSchematic('regenerate', { name: 'default' }, treeWithNestCli({
+        sourceRoot: 'src',
+      }));
+
+      expect(spawnEmitter).toHaveBeenCalledWith(
+        expect.objectContaining({ appModulePath: nestedAppModule }),
+      );
+    } finally {
+      fs.rmSync(nestedAppModule, { force: true });
+      if (!preExisting) fs.rmSync(nestedDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// CRITICAL: `outFile` is the user's `autoSchemaFile` verbatim, and a schematic
+// `Tree` is rooted at the project, so its paths are project-relative. The old
+// `'/' + outFile.replace(/^\.?\//, '')` handled exactly one of the shapes
+// @nestjs/graphql accepts. The other three wrote to junk paths — silently
+// committing a new file in a deep directory while the real schema went stale,
+// and never reporting "up to date" because `tree.read()` of that path was
+// always null.
+describe('regenerate — mapping autoSchemaFile onto a Tree path', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  function runWithOutFile(outFile: string, tree = treeWithNestCli({ sourceRoot: 'src' })) {
+    const { spawnEmitter } = require('../src/emitter/spawn');
+    spawnEmitter.mockResolvedValueOnce({
+      ok: true,
+      sdl: 'type Query {\n  ok: String\n}\n',
+      outFile,
+    });
+    const runner = new SchematicTestRunner('nest-graphql', collectionPath);
+    return runner.runSchematic('regenerate', { name: 'default' }, tree);
+  }
+
+  it('maps a project-relative path onto the matching Tree path', async () => {
+    const result = await runWithOutFile('src/schema.gql');
+    expect(result.readContent('/src/schema.gql')).toContain('type Query');
+  });
+
+  it('maps a "./"-prefixed path onto the matching Tree path', async () => {
+    const result = await runWithOutFile('./src/schema.gql');
+    expect(result.readContent('/src/schema.gql')).toContain('type Query');
+  });
+
+  it('maps an absolute in-project path back onto the project-relative Tree path', async () => {
+    // `join(process.cwd(), 'src/schema.gql')` is the form the official NestJS
+    // code-first docs use, and the form this repo's own fixtures use. It used
+    // to land at a Tree path mirroring the whole machine directory layout.
+    const result = await runWithOutFile(path.join(process.cwd(), 'src', 'schema.gql'));
+    expect(result.readContent('/src/schema.gql')).toContain('type Query');
+  });
+
+  it('still reports "up to date" for an absolute path whose content matches', async () => {
+    // The regression that made this invisible: with a junk target,
+    // `tree.read(target)` was always null, so the short-circuit never fired
+    // and every run looked like it had produced a change.
+    const messages: string[] = [];
+    const tree = treeWithNestCli({ sourceRoot: 'src' });
+    tree.create('/src/schema.gql', 'type Query {\n  ok: String\n}\n');
+    const overwriteSpy = jest.spyOn(tree, 'overwrite');
+
+    const { spawnEmitter } = require('../src/emitter/spawn');
+    spawnEmitter.mockResolvedValueOnce({
+      ok: true,
+      sdl: 'type Query {\n  ok: String\n}\n',
+      outFile: path.join(process.cwd(), 'src', 'schema.gql'),
+    });
+    const runner = new SchematicTestRunner('nest-graphql', collectionPath);
+    runner.logger.subscribe((e) => messages.push(e.message));
+
+    await runner.runSchematic('regenerate', { name: 'default' }, tree);
+
+    expect(messages.join('\n')).toMatch(/up to date/);
+    expect(overwriteSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses a path that escapes the project root rather than writing junk', async () => {
+    await expect(runWithOutFile(path.join(process.cwd(), '..', 'outside.gql'))).rejects.toThrow(
+      /outside the project root/,
+    );
+  });
+
+  it('refuses an absolute path on another branch of the filesystem', async () => {
+    await expect(runWithOutFile('/etc/schema.gql')).rejects.toThrow(/outside the project root/);
+  });
 });
 
 // `buildProject` is mocked (above) for every test in the `regenerate` describe block --

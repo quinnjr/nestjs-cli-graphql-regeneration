@@ -110,6 +110,29 @@ If the compiled config can't be found, or doesn't export the requested
 schema name, the error names every path that was checked and every schema
 name that *is* available.
 
+### Which options a schema entry may set
+
+A schema entry is a subset of `@nestjs/graphql`'s own `GqlModuleOptions` —
+the type is literally derived from it (`Pick<GqlModuleOptions, ...>` in
+`src/config/resolve.ts`), so these behave exactly as they do at boot:
+
+| Option | Notes |
+|---|---|
+| `autoSchemaFile` | Where to write. `string` or `{ path }`; **must resolve inside the project**, since a schematic can only write within the project it runs against. An absolute path (`join(process.cwd(), 'src/schema.gql')`, as the Nest docs use) is fine and is mapped back to a project-relative path. `true` is rejected: it tells the boot path to build the schema in memory and write nothing, which leaves this schematic with nothing to do. |
+| `sortSchema` | Lexicographic sort. |
+| `include` | Modules to scan. **Transitive**: naming a module also picks up everything it `imports`, exactly as at boot. |
+| `buildSchemaOptions` | Passed to the schema factory (`orphanedTypes`, `scalarsMap`, `dateScalarMode`, `addNewlineAtEnd`, ...). |
+| `transformSchema` | Only applied to the written file when `transformAutoSchemaFile` is also set — matching `GraphQLSchemaBuilder`, which gates on `transformAutoSchemaFile && transformSchema`. An app that transforms its *served* schema writes an untransformed `.gql` at boot, and so do we. |
+| `transformAutoSchemaFile` | Opts `transformSchema` into the written file. Defaults falsy. |
+
+`addNewlineAtEnd` belongs under `buildSchemaOptions` (that is where upstream
+declares it, on `BuildSchemaOptions`). A top-level `addNewlineAtEnd` is still
+honoured as a legacy alias, but the nested form wins when both are present.
+
+Every option in that table has a byte-parity test that boots a real app with
+it set and compares against our output — see `test/parity-config.spec.ts`,
+which also fails if an option is added without such a test.
+
 ## Options
 
 The schematic accepts every property `nest g` injects into a generator
