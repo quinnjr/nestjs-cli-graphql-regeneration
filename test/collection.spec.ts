@@ -2,22 +2,34 @@ import { SchematicTestRunner } from '@angular-devkit/schematics/testing';
 import { NodeModulesEngineHost } from '@angular-devkit/schematics/tools';
 import { SchematicEngine, Tree } from '@angular-devkit/schematics';
 import * as path from 'path';
+import { readFileSync } from 'fs';
+import { publishForSchematicsRequire } from './helpers/schematics-require-bridge';
+// Imported here, below the hoisted `vi.mock` calls, so the factory module is built against
+// the mocks — exactly what ts-jest's single CJS registry gave the engine implicitly.
+import * as regenerateFactory from '../src/regenerate/index';
 
 // The Rule under test (Task 9) really builds and really spawns the emitter. Those are covered
 // end to end elsewhere (test/regenerate.spec.ts, test/parity.spec.ts); here we only need the
 // Rule to run to completion so this test can keep proving what it always proved: that every
 // property `nest g` injects survives schema validation and the factory actually executes.
-jest.mock('../src/emitter/spawn', () => ({
-  spawnEmitter: jest.fn().mockResolvedValue({
+vi.mock('../src/emitter/spawn', () => ({
+  spawnEmitter: vi.fn().mockResolvedValue({
     ok: true,
     sdl: 'type Query {\n  ok: String\n}\n',
     outFile: 'src/schema.gql',
   }),
 }));
 
-jest.mock('../src/regenerate/build-project', () => ({
-  buildProject: jest.fn().mockResolvedValue(undefined),
+vi.mock('../src/regenerate/build-project', () => ({
+  buildProject: vi.fn().mockResolvedValue(undefined),
 }));
+
+// The engine resolves `src/collection.json`'s factory with Node's `require`, which can
+// neither load `.ts` nor see the `vi.mock` calls above.
+publishForSchematicsRequire(
+  path.join(__dirname, '..', 'src', 'regenerate', 'index.ts'),
+  regenerateFactory,
+);
 
 const collectionPath = path.join(__dirname, '..', 'src', 'collection.json');
 const distCollectionPath = path.join(__dirname, '..', 'dist', 'collection.json');
@@ -75,7 +87,9 @@ describe('regenerate schematic registration', () => {
   });
 
   it('does not lock down additional properties', () => {
-    const schema = require('../src/regenerate/schema.json');
+    const schema = JSON.parse(
+      readFileSync(path.join(__dirname, '..', 'src', 'regenerate', 'schema.json'), 'utf8'),
+    );
     expect(schema.additionalProperties).toBeUndefined();
   });
 
@@ -109,7 +123,7 @@ describe('regenerate schematic registration', () => {
 describe('production build (dist/) smoke test', () => {
   it('loads the compiled collection through the real NodeModulesEngineHost', () => {
     // Exercises the exact mechanism `nest g` uses in production: the non-test engine host
-    // resolving the built CommonJS output via `require()` -- not the ts-jest-transformed
+    // resolving the built CommonJS output via `require()` -- not the SWC-transformed
     // `src/*.ts` that the tests above exercise. `pretest` (`pnpm build`) keeps `dist/` fresh
     // for this test.
     const host = new NodeModulesEngineHost();

@@ -66,6 +66,12 @@ function warnIfVersionIsolationDiverges(projectRoot: string): void {
  * `process.exit()`) so an asynchronous multi-megabyte write could drain — a
  * synchronous write removes that hazard entirely instead of managing it.
  * Partial writes are looped over because `write(2)` may return short.
+ *
+ * That property is what lets the exit handlers below call `process.exit()`
+ * outright: when this function returns, every byte has been handed to the
+ * kernel (`fs.writeSync` is a direct `write(2)`, and the loop only ends once
+ * `offset === buf.length`), and bytes already in a pipe stay readable by the
+ * parent after the writer exits. Nothing is left pending to be lost.
  */
 function writePayload(payload: EmitSuccess | EmitFailure): void {
   const buf = Buffer.from(JSON.stringify(payload), 'utf8');
@@ -106,14 +112,47 @@ async function main(): Promise<void> {
   writePayload({ ok: true, sdl, outFile });
 }
 
-main().catch((err: Error) => {
-  try {
-    writePayload({ ok: false, message: err.message, stack: err.stack });
-  } catch {
-    // The payload descriptor is unavailable (e.g. this entry was run by hand
-    // rather than by ../emitter/spawn.ts). Losing the diagnostic entirely is
-    // strictly worse than printing it.
-    process.stderr.write(`[nest-graphql] emitter failed: ${err.stack ?? err.message}\n`);
-  }
-  process.exitCode = 1;
-});
+main().then(
+  () => {
+    // Exit explicitly rather than waiting for the event loop to empty. The
+    // payload write above is a *completed* synchronous write (see
+    // writePayload), so there is nothing pending to flush — while anything
+    // the user's app module started at import time (a `setInterval`, an
+    // eagerly-connected DB client, a file watcher) keeps this process alive
+    // indefinitely. That costs more than a slow exit: ../emitter/spawn.ts
+    // settles its promise on 'close', so a child that never exits is a
+    // `nest g` that hangs forever with no output at all.
+    process.exit(0);
+  },
+  (err: unknown) => {
+    // Deliberately typed `unknown`, not `Error`: `require(req.appModulePath)`
+    // above runs arbitrary user code at module scope, where `throw 'string'`,
+    // `throw { code }` and `throw null` are all reachable. An un-normalized
+    // non-Error is not merely untidy — `err.message` is `undefined`,
+    // `JSON.stringify` *drops* undefined keys, so the payload degrades to
+    // `{"ok":false}`, spawn.ts's `isEmitResult` rejects it as malformed, and
+    // the user is shown a generic "unexpected output" that reads like a bug
+    // in this package rather than the throw in theirs. `null`/`undefined`
+    // additionally used to make the stderr fallback below throw again.
+    const normalized =
+      err instanceof Error ? err : new Error(typeof err === 'string' ? err : String(err));
+    try {
+      writePayload({ ok: false, message: normalized.message, stack: normalized.stack });
+    } catch {
+      // The payload descriptor is unavailable (e.g. this entry was run by hand
+      // rather than by ../emitter/spawn.ts). Losing the diagnostic entirely is
+      // strictly worse than printing it. `writeSync` rather than
+      // `process.stderr.write` because `process.exit()` follows immediately:
+      // stderr writes are asynchronous when it is a pipe on some platforms,
+      // and an exit does not wait for them.
+      try {
+        writeSync(2, `[nest-graphql] emitter failed: ${normalized.stack ?? normalized.message}\n`);
+      } catch {
+        // Neither the payload descriptor nor stderr is writable. There is no
+        // channel left to report on; still exit non-zero rather than turning
+        // this into an unhandled rejection.
+      }
+    }
+    process.exit(1);
+  },
+);

@@ -4,14 +4,22 @@ import { spawn } from 'child_process';
 // should never contain anything but this. Validated before use regardless of the spawn
 // mechanism below, as defence in depth against the whole category of shell/argument
 // injection, not just the one instance closed by dropping `shell: true`.
-const PROJECT_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+//
+// The leading character is restricted separately because argument injection is precisely
+// what *survives* removing the shell: the name is appended to `nest build`, so a name of
+// `-w` becomes `nest build -w` -- watch mode, which never exits, so `close` never fires
+// and the promise below never settles, hanging the CLI until CI times it out. `-c<file>`
+// is quieter and worse: it builds against a different tsconfig than the one this
+// schematic parsed, so the emitted schema describes code that was never compiled.
+const PROJECT_NAME_PATTERN = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/;
 
 export function buildProject(projectRoot: string, projectName?: string): Promise<void> {
   if (projectName !== undefined && !PROJECT_NAME_PATTERN.test(projectName)) {
     return Promise.reject(
       new Error(
         `Invalid project name "${projectName}": nest-cli.json project names may only ` +
-          'contain letters, digits, ".", "_", and "-".',
+          'contain letters, digits, ".", "_", and "-", and may not begin with "-" ' +
+          '(a leading "-" would be read by "nest build" as a command-line flag).',
       ),
     );
   }

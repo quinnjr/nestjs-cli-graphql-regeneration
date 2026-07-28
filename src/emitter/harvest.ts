@@ -62,9 +62,35 @@ export function harvest(
 
   for (const module of selectModules(container, include)) {
     for (const wrapper of module.providers.values()) {
+      // Known, deliberate boundary — not a bug to "fix" here. For a
+      // `useFactory` provider, `metatype` is the factory function, not the
+      // class it constructs, so a resolver only ever reached through a
+      // factory is invisible to this check and silently dropped. Boot sees
+      // it via `ResolversExplorerService.getAllCtors()`, which reads
+      // `instance.constructor` — but that requires the provider to already
+      // be instantiated, which is exactly what preview mode exists to avoid.
+      // See README.md's "Known limitations" for the user-facing writeup and
+      // workaround (register the class directly, or via `useClass`).
       const metatype = wrapper.metatype;
       if (typeof metatype !== 'function') continue;
-      if (Reflect.getMetadata(RESOLVER_TYPE_METADATA, metatype)) resolvers.push(metatype);
+      // `hasMetadata`, not a truthiness test on `getMetadata`. A bare
+      // `@Resolver()` (no name, no type function) reaches
+      // `addResolverMetadata(undefined, undefined, target)` upstream, which
+      // does `SetMetadata(RESOLVER_TYPE_METADATA, resolver || name)` — i.e.
+      // it *defines* the key with the value `undefined`. Testing truthiness
+      // therefore drops exactly the class the boot path keeps: at boot,
+      // `ResolversExplorerService.getAllCtors` maps every provider in the
+      // included modules to its constructor with no metadata filter at all,
+      // so a bare `@Resolver()` is unconditionally handed to
+      // `GraphQLSchemaFactory.create`. Observed divergence: boot emitted
+      // `hello` + `recipes`, this path emitted only `recipes`.
+      if (Reflect.hasMetadata(RESOLVER_TYPE_METADATA, metatype)) resolvers.push(metatype);
+      // Truthiness *is* correct here, and is not an oversight to be made
+      // symmetric with the line above: `GraphQLSchemaFactory`'s
+      // `addScalarTypeByClassRef` opens with
+      // `if (!scalarNameMetadata) { return; }`, so a falsy `@Scalar()` name
+      // registers nothing at boot either. Mirroring that bail-out is the
+      // whole point.
       if (Reflect.getMetadata(SCALAR_NAME_METADATA, metatype)) scalars.push(metatype);
     }
   }

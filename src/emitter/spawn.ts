@@ -3,8 +3,6 @@ import { existsSync } from 'fs';
 import * as path from 'path';
 import { EmitRequest, EmitSuccess, EmitFailure, PAYLOAD_FD } from './protocol';
 
-export { EmitRequest, EmitSuccess, EmitFailure, PAYLOAD_FD };
-
 // The child always loads compiled JavaScript, so child.js must exist as a real
 // file on disk. Post-build, this module runs as dist/emitter/spawn.js with
 // dist/emitter/child.js right beside it. Under ts-jest, though, this module
@@ -14,11 +12,20 @@ export { EmitRequest, EmitSuccess, EmitFailure, PAYLOAD_FD };
 // (findDistFile/resolveDistFile) — a different dual-candidate list (this
 // module's own source-vs-compiled location, not that module's flat-vs-nested
 // dist/ layout), but the same "probe existsSync over an ordered list" shape.
-function resolveChildEntry(): string {
-  const candidates = [
-    path.join(__dirname, 'child.js'),
-    path.join(__dirname, '..', '..', 'dist', 'emitter', 'child.js'),
-  ];
+//
+// `NEST_GRAPHQL_CHILD_ENTRY` overrides both candidates. It exists so tests can
+// exercise the missing-entry and malformed-payload branches against a throwaway
+// file of their own, instead of renaming or overwriting the shared, real
+// dist/emitter/child.js in place: those tests restored it in a `finally`, but a
+// timeout, an abort or a crash between the two halves left dist/ corrupted, and
+// a later bare `jest` would then run silently against the stub.
+function resolveChildEntry(explicit = process.env.NEST_GRAPHQL_CHILD_ENTRY): string {
+  const candidates = explicit
+    ? [explicit]
+    : [
+        path.join(__dirname, 'child.js'),
+        path.join(__dirname, '..', '..', 'dist', 'emitter', 'child.js'),
+      ];
   const found = candidates.find((c) => existsSync(c));
   if (!found) {
     throw new Error(
@@ -28,6 +35,19 @@ function resolveChildEntry(): string {
     );
   }
   return found;
+}
+
+// How the child ended, in a form fit to appear inside an error message.
+//
+// Without this, the two "the payload was unusable" rejections below described
+// only the *absence* of output, never the cause: an OOM kill (SIGKILL from the
+// kernel, no stderr, no payload) and a child that merely wrote nothing produced
+// byte-identical errors. The exit code or signal is the only signal that
+// distinguishes them, and Node hands it to the 'close' listener for free.
+function describeExit(code: number | null, signal: NodeJS.Signals | null): string {
+  if (signal) return `killed by signal ${signal}`;
+  if (code !== null) return `exited with code ${code}`;
+  return 'exit status unknown';
 }
 
 // Guards against a parseable-but-wrong-shaped blob silently producing
@@ -83,25 +103,46 @@ export function spawnEmitter(req: EmitRequest): Promise<EmitSuccess> {
     let payload = '';
     let stderr = '';
 
+    // setEncoding, *not* `chunk.toString()` per chunk. A pipe hands over
+    // arbitrary byte boundaries, so a multi-byte UTF-8 sequence routinely
+    // straddles two chunks; decoding each chunk independently turns the split
+    // sequence into U+FFFD replacement characters. That corruption is silent —
+    // the JSON still parses, so the mangled SDL reaches the written schema
+    // file. Measured: 8 replacement characters in a 200 KB non-ASCII payload.
+    // setEncoding installs a StringDecoder that holds the incomplete tail bytes
+    // back until the next chunk completes them.
     const payloadStream = child.stdio[PAYLOAD_FD] as NodeJS.ReadableStream | undefined;
-    if (payloadStream) payloadStream.on('data', (d) => (payload += d.toString()));
+    if (payloadStream) {
+      payloadStream.setEncoding('utf8');
+      payloadStream.on('data', (d) => (payload += d));
+    }
 
     const stderrStream = child.stderr;
-    if (stderrStream) stderrStream.on('data', (d) => (stderr += d.toString()));
+    if (stderrStream) {
+      stderrStream.setEncoding('utf8');
+      stderrStream.on('data', (d) => (stderr += d));
+    }
 
     // 'close' (not 'exit') fires only once every piped stdio stream has also
     // closed, so the payload is complete by the time this runs.
-    child.on('close', () => {
+    child.on('close', (code, signal) => {
       let parsed: unknown;
       try {
         parsed = JSON.parse(payload.trim());
       } catch {
-        reject(new Error(`Emitter produced no usable output.\n${stderr}`));
+        reject(
+          new Error(
+            `Emitter produced no usable output (${describeExit(code, signal)}).\n${stderr}`,
+          ),
+        );
         return;
       }
       if (!isEmitResult(parsed)) {
         reject(
-          new Error(`Emitter produced unexpected output: ${payload.trim()}\n${stderr}`),
+          new Error(
+            `Emitter produced unexpected output (${describeExit(code, signal)}): ` +
+              `${payload.trim()}\n${stderr}`,
+          ),
         );
         return;
       }

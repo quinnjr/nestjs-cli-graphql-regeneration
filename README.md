@@ -37,10 +37,17 @@ alongside this package:
   build".
   ```
 
-- `@nestjs/common`, `@nestjs/core` (`>=10`), `@nestjs/graphql` (`>=12`), and
-  `@nestjs/schematics` (`>=10`) — declared as peer dependencies. Whatever
+- `@nestjs/common`, `@nestjs/core` (`>=10`), `@nestjs/graphql` (`>=12.2.0`),
+  and `@nestjs/schematics` (`>=10`) — declared as peer dependencies. Whatever
   your application already depends on satisfies these; nothing extra to add
   for a typical Nest + GraphQL project.
+
+  The `@nestjs/graphql` floor is `12.2.0`, not just `12`: `GRAPHQL_SDL_FILE_END`
+  and the `addNewlineAtEnd` plumbing in `GraphQLSchemaBuilder.generateSchema`
+  were introduced together in `12.2.0`. On an older `12.0.x`/`12.1.x` install,
+  `src/emitter/serialize.ts`'s deep import of that constant resolves to
+  `undefined`, and a load-time guard there throws rather than silently
+  appending the literal string `"undefined"` to your schema file.
 
 ## Use
 
@@ -215,6 +222,30 @@ the ambient resolution of `@nestjs/core` (what it will actually use) against
 a resolution scoped explicitly to your project root, and writes a warning to
 stderr if they disagree. If you see that warning, install this tool locally
 in the target project rather than globally.
+
+## Known limitations
+
+**Resolvers registered via `useFactory` are not detected.** A provider
+registered as `{ provide: SOME_TOKEN, useFactory: () => new SomeResolver() }`
+is invisible to this tool. `harvest()` (`src/emitter/harvest.ts`) reads
+`wrapper.metatype` to find candidate classes; for a `useFactory` provider,
+`metatype` is the factory function itself, not the class it happens to
+construct and return — so a class carrying `@Resolver()`/`@Query()` is
+silently dropped from the emitted SDL whenever it's only ever reached through
+a factory.
+
+A real boot doesn't hit this: `ResolversExplorerService.getAllCtors()` reads
+`instance.constructor`, which only exists once the provider has actually been
+*instantiated* by Nest's DI container. That's not a gap this tool can close
+the same way — reading `instance.constructor` requires instantiating exactly
+the providers preview mode exists to avoid instantiating (see "Isolation from
+your project's Nest version" above, and `test/fixtures/exploding` for why
+that avoidance matters). There is no metadata-only equivalent to inspect.
+
+**Workaround:** register the resolver class directly as a provider
+(`providers: [SomeResolver]`), or via `useClass`
+(`{ provide: SOME_TOKEN, useClass: SomeResolver }`) — both keep the class
+itself as `wrapper.metatype`, which this tool does inspect.
 
 ## CI
 

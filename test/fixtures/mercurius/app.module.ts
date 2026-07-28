@@ -3,6 +3,7 @@ import { GraphQLModule } from '@nestjs/graphql';
 import { MercuriusDriver, MercuriusDriverConfig } from '@nestjs/mercurius';
 import { join } from 'path';
 import { RecipesResolver } from '../basic/recipes.resolver';
+import { HelloResolver } from '../basic/hello.resolver';
 
 export const MERCURIUS_SCHEMA_FILE = join(__dirname, 'boot-schema.gql');
 
@@ -25,6 +26,9 @@ export const MERCURIUS_SCHEMA_FILE = join(__dirname, 'boot-schema.gql');
       cache: false,
     }),
   ],
-  providers: [RecipesResolver],
+  // Kept in lockstep with test/fixtures/basic/app.module.ts's provider list:
+  // test/parity-mercurius.spec.ts compares this module's SDL directly against
+  // the Apollo fixture's, so the two must declare the same resolvers.
+  providers: [RecipesResolver, HelloResolver],
 })
 export class MercuriusAppModule {}

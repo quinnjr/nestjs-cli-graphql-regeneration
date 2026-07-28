@@ -20,7 +20,7 @@ import * as path from 'path';
  *
  * Single source of truth: every dist lookup goes through here.
  */
-export const DIST_LAYOUT_SUBDIRS = ['', 'src'] as const;
+const DIST_LAYOUT_SUBDIRS = ['', 'src'] as const;
 
 /** Every path a `basename` could legitimately occupy inside a build output. */
 export function distCandidates(distRoot: string, basename: string): string[] {

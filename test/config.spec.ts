@@ -33,6 +33,13 @@ const CONFIG_JS_THROWS = `
 throw new Error('boom');
 `;
 
+// A named frame inside the user's own config file, so the surfaced stack can
+// be asserted to point *there* rather than at this package's loader.
+const CONFIG_JS_THROWS_DEEP = `
+function explodeInsideTheUsersConfig() { throw new Error('boom from the config'); }
+explodeInsideTheUsersConfig();
+`;
+
 describe('resolveConfig', () => {
   it('finds the config at the dist root', () => {
     const dir = scratch();
@@ -97,6 +104,36 @@ describe('resolveConfig', () => {
     expect(caught!.cause).toBeInstanceOf(Error);
     expect((caught!.cause as Error).message).toBe('boom');
     expect((caught!.cause as Error).stack).toContain('graphql.config.js');
+  });
+
+  it('surfaces a stack pointing at the line of the user config that threw', () => {
+    // `cause` alone is not enough: the emitter child reports failures across a
+    // process boundary as `EmitFailure` (message + stack, no `cause`), so an
+    // object reference hanging off `cause` is dropped in transit and the user
+    // is left with a stack describing *this package's* loader. Merging the
+    // original stack into the thrown error's own `stack` is what actually
+    // reaches them.
+    const dir = scratch();
+    const configPath = path.join(dir, 'graphql.config.js');
+    writeFileSync(configPath, CONFIG_JS_THROWS_DEEP);
+
+    let caught: Error | undefined;
+    try {
+      resolveConfig(dir, 'default');
+    } catch (err) {
+      caught = err as Error;
+    }
+
+    expect(caught).toBeDefined();
+    const stack = caught!.stack ?? '';
+    // A real call frame in the user's file — not merely the config path, which
+    // the wrapper's own message already contains.
+    expect(stack).toMatch(/\n\s+at\b[^\n]*graphql\.config\.js:\d+:\d+/);
+    expect(stack).toContain('explodeInsideTheUsersConfig');
+    // The wrapper's context survives too; the merge adds to the message, it
+    // does not replace it.
+    expect(stack).toContain('Failed to load GraphQL schema config at');
+    expect(caught!.message).toContain('boom from the config');
   });
 });
 

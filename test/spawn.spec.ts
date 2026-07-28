@@ -1,25 +1,9 @@
-import {
-  mkdtempSync,
-  writeFileSync,
-  readFileSync,
-  cpSync,
-  mkdirSync,
-  rmSync,
-  renameSync,
-} from 'fs';
+import { mkdtempSync, writeFileSync, cpSync, mkdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import * as path from 'path';
 import { spawnEmitter } from '../src/emitter/spawn';
 import { resolveDistFile } from '../src/config/dist-layout';
 import { APP_MODULE_BASENAME } from '../src/config/resolve';
-
-// dist/emitter/child.js is the real compiled entry spawn.ts locates at
-// runtime (see spawn.ts's resolveChildEntry). A couple of tests below
-// temporarily rename or overwrite it in place to exercise failure paths that
-// can't otherwise be triggered through the public EmitRequest surface. Safe
-// because Jest runs the `it` blocks in this file sequentially, and no other
-// spec file calls spawnEmitter / depends on this file mid-run.
-const REAL_CHILD_JS = path.join(__dirname, '..', 'dist', 'emitter', 'child.js');
 
 const tempDirs: string[] = [];
 function tempDir(prefix: string): string {
@@ -33,6 +17,30 @@ afterAll(() => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/**
+ * Point spawn.ts's `resolveChildEntry` at a throwaway file for the duration of
+ * `fn`, then put `NEST_GRAPHQL_CHILD_ENTRY` back exactly as it was.
+ *
+ * A few failure paths (no compiled entry at all; a child that speaks the
+ * protocol wrongly; a child killed by a signal) can't be reached through the
+ * public `EmitRequest` surface — the child has to be replaced. These tests used
+ * to do that by renaming or overwriting the *real* `dist/emitter/child.js` in
+ * place and restoring it in a `finally`. That works right up until it doesn't:
+ * a Jest timeout, a `--bail` abort or a crash between the two halves leaves the
+ * repo's own build output replaced by a stub, and the next bare `vitest` run then
+ * tests the stub without saying so. Nothing here touches `dist/` any more.
+ */
+async function withChildEntry<T>(entry: string, fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.NEST_GRAPHQL_CHILD_ENTRY;
+  process.env.NEST_GRAPHQL_CHILD_ENTRY = entry;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.NEST_GRAPHQL_CHILD_ENTRY;
+    else process.env.NEST_GRAPHQL_CHILD_ENTRY = previous;
+  }
+}
 
 const GRAPHQL_CONFIG_JS =
   `module.exports.schemas = { default: { autoSchemaFile: 'src/schema.gql', sortSchema: true } };`;
@@ -158,9 +166,11 @@ describe('spawnEmitter', () => {
     // followed by process.exit(1) reliably truncates around ~146KB over a
     // real OS pipe. child.ts now writes the payload with a synchronous,
     // short-write-tolerant loop (writeSync) to the dedicated descriptor in
-    // ./protocol.ts, and never calls process.exit() itself — the process
-    // ends naturally (via process.exitCode on failure, or the default 0 once
-    // main() resolves), only after that write loop has already completed.
+    // ./protocol.ts, and only calls process.exit() explicitly (0 on success,
+    // 1 on failure) once that write loop has already completed — so every
+    // byte is in the kernel's hands before the process ever ends, and a
+    // child that would otherwise hang the CLI open (an app module's stray
+    // setInterval or DB client) can't do so.
     const dir = tempDir('gqlspawn-large-error-');
     const distRoot = path.join(dir, 'dist');
     mkdirSync(distRoot, { recursive: true });
@@ -297,9 +307,12 @@ describe('spawnEmitter', () => {
   });
 
   it('rejects rather than throws when the compiled child entry is missing', async () => {
-    const movedAside = `${REAL_CHILD_JS}.moved-for-test`;
-    renameSync(REAL_CHILD_JS, movedAside);
-    try {
+    const dir = tempDir('gqlspawn-missing-entry-');
+    // A path that deliberately does not exist, so resolveChildEntry's
+    // existsSync probe fails over its only candidate.
+    const absentEntry = path.join(dir, 'child.js');
+
+    await withChildEntry(absentEntry, async () => {
       await expect(
         spawnEmitter({
           projectRoot: process.cwd(),
@@ -308,25 +321,24 @@ describe('spawnEmitter', () => {
           schemaName: 'default',
         }),
       ).rejects.toThrow(/Could not find the compiled emitter child entry/);
-    } finally {
-      renameSync(movedAside, REAL_CHILD_JS);
-    }
+    });
   });
 
   it('surfaces a clear error for parseable-but-wrong-shaped child output', async () => {
-    const backup = readFileSync(REAL_CHILD_JS, 'utf8');
+    const dir = tempDir('gqlspawn-wrong-shape-');
     // Writes to the dedicated payload descriptor, not stdout: the result
     // payload moved off stdout so a `console.log` in user code can no longer
     // corrupt it (see src/emitter/protocol.ts). A stub emulating the child
     // has to emulate the protocol it actually speaks — on stdout this blob
     // would now be indistinguishable from ordinary user output, which is
     // precisely the property the move buys.
+    const stubEntry = path.join(dir, 'wrong-shape-child.js');
     writeFileSync(
-      REAL_CHILD_JS,
+      stubEntry,
       `require('fs').writeSync(3, JSON.stringify({ unexpected: 'shape' }));\n`,
     );
-    try {
-      let caught: Error | undefined;
+
+    const caught = await withChildEntry(stubEntry, async () => {
       try {
         await spawnEmitter({
           projectRoot: process.cwd(),
@@ -335,13 +347,151 @@ describe('spawnEmitter', () => {
           schemaName: 'default',
         });
       } catch (err) {
-        caught = err as Error;
+        return err as Error;
       }
-      expect(caught).toBeDefined();
-      expect(caught!.message).not.toBe('undefined');
-      expect(caught!.message).toMatch(/unexpected output/i);
-    } finally {
-      writeFileSync(REAL_CHILD_JS, backup);
+      return undefined;
+    });
+
+    expect(caught).toBeDefined();
+    expect(caught!.message).not.toBe('undefined');
+    expect(caught!.message).toMatch(/unexpected output/i);
+  });
+
+  it('does not corrupt multi-byte characters that straddle a pipe chunk boundary', async () => {
+    // Regression test. The payload arrives as a stream of arbitrarily-sized
+    // Buffers, and a UTF-8 sequence routinely straddles two of them. Decoding
+    // each chunk independently (`payload += chunk.toString()`) turns every
+    // split sequence into U+FFFD — and the damage is *silent*: the JSON still
+    // parses, so a mangled SDL would be written to the user's schema file
+    // rather than failing loudly. Measured 8 replacement characters in a
+    // 200 KB non-ASCII payload before spawn.ts called setEncoding('utf8').
+    //
+    // The existing 5 MB 'X'.repeat() test above cannot catch this: pure ASCII
+    // is one byte per character, so no chunk boundary can ever split one.
+    // What matters here is byte-width variety (2, 3 and 4-byte sequences) and
+    // enough total volume to cross many chunk boundaries, not raw size.
+    const dir = tempDir('gqlspawn-utf8-');
+    const distRoot = path.join(dir, 'dist');
+    mkdirSync(distRoot, { recursive: true });
+    writeFileSync(path.join(distRoot, 'graphql.config.js'), GRAPHQL_CONFIG_JS);
+
+    // 15 UTF-8 bytes per unit across four different sequence widths, so only
+    // 5 of every 15 byte offsets fall on a character boundary.
+    const unit = 'é—漢字🎉';
+    const bigMessage = unit.repeat(60_000); // ~900 KB, well over a dozen chunks
+    const modulePath = path.join(distRoot, 'utf8-error.js');
+    writeFileSync(modulePath, `throw new Error(${JSON.stringify(bigMessage)});`);
+
+    let caught: Error | undefined;
+    try {
+      await spawnEmitter({
+        projectRoot: process.cwd(),
+        distRoot,
+        appModulePath: modulePath,
+        schemaName: 'default',
+      });
+    } catch (err) {
+      caught = err as Error;
     }
+
+    expect(caught).toBeDefined();
+    expect(caught!.message).not.toContain('�');
+    expect(caught!.message).toBe(bigMessage);
+  });
+
+  it('reports the child exit code when it dies without producing output', async () => {
+    // "Emitter produced no usable output" on its own describes the absence of
+    // a payload and nothing about the cause. The exit status is the only thing
+    // that distinguishes a child that exited cleanly having written nothing
+    // from one that failed — and Node hands it to the 'close' listener for
+    // free, so discarding it was pure loss.
+    const dir = tempDir('gqlspawn-exit-code-');
+    const distRoot = path.join(dir, 'dist');
+    mkdirSync(distRoot, { recursive: true });
+    writeFileSync(path.join(distRoot, 'graphql.config.js'), GRAPHQL_CONFIG_JS);
+
+    const exitingModulePath = path.join(distRoot, 'exit-7.js');
+    writeFileSync(exitingModulePath, `process.exit(7);\n`);
+
+    await expect(
+      spawnEmitter({
+        projectRoot: process.cwd(),
+        distRoot,
+        appModulePath: exitingModulePath,
+        schemaName: 'default',
+      }),
+    ).rejects.toThrow(/produced no usable output \(exited with code 7\)/i);
+  });
+
+  it('reports the killing signal when the child is killed', async () => {
+    // The case this finding was actually about: an OOM kill. The kernel sends
+    // SIGKILL, the child writes nothing, there is no stderr and no exit code —
+    // so without the signal the user is told only "produced no usable output"
+    // for what is really "your machine ran out of memory". A child that kills
+    // itself reproduces exactly that shape.
+    const dir = tempDir('gqlspawn-signal-');
+    const stubEntry = path.join(dir, 'self-kill-child.js');
+    writeFileSync(stubEntry, `process.kill(process.pid, 'SIGKILL');\n`);
+
+    await withChildEntry(stubEntry, async () => {
+      await expect(
+        spawnEmitter({
+          projectRoot: process.cwd(),
+          distRoot: '/nonexistent',
+          appModulePath: '/nonexistent/app.module.js',
+          schemaName: 'default',
+        }),
+      ).rejects.toThrow(/produced no usable output \(killed by signal SIGKILL\)/i);
+    });
+  });
+
+  it('accepts an app module exported as `default` rather than `AppModule`', async () => {
+    // src/emitter/child.ts resolves `mod.AppModule ?? mod.default`. The
+    // `default` half covers a CommonJS build of `export default class
+    // AppModule` — the shape `tsc` emits for a project whose entry module is a
+    // default export — and had no coverage, so a regression that dropped the
+    // fallback would have been caught only by a user.
+    const dir = tempDir('gqlspawn-default-export-');
+    const distRoot = path.join(dir, 'dist');
+    mkdirSync(distRoot, { recursive: true });
+    cpSync(path.join(__dirname, 'fixtures-dist'), distRoot, { recursive: true });
+    writeFileSync(path.join(distRoot, 'graphql.config.js'), GRAPHQL_CONFIG_JS);
+
+    const defaultOnlyPath = path.join(distRoot, 'default-export-app.module.js');
+    writeFileSync(
+      defaultOnlyPath,
+      // Deliberately exports *only* `default`, so `mod.AppModule` is undefined
+      // and the fallback is the only thing that can resolve this.
+      `module.exports.default = require('./basic/app.module').AppModule;\n`,
+    );
+
+    const result = await spawnEmitter({
+      projectRoot: process.cwd(),
+      distRoot,
+      appModulePath: defaultOnlyPath,
+      schemaName: 'default',
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.sdl).toContain('type Recipe');
+  });
+
+  it('rejects with a clear message when the app module exports neither shape', async () => {
+    const dir = tempDir('gqlspawn-no-app-module-');
+    const distRoot = path.join(dir, 'dist');
+    mkdirSync(distRoot, { recursive: true });
+    writeFileSync(path.join(distRoot, 'graphql.config.js'), GRAPHQL_CONFIG_JS);
+
+    const wrongExportPath = path.join(distRoot, 'not-an-app-module.js');
+    writeFileSync(wrongExportPath, `module.exports = { somethingElse: class {} };\n`);
+
+    await expect(
+      spawnEmitter({
+        projectRoot: process.cwd(),
+        distRoot,
+        appModulePath: wrongExportPath,
+        schemaName: 'default',
+      }),
+    ).rejects.toThrow(/does not export AppModule/);
   });
 });

@@ -1,5 +1,6 @@
 import type { GqlModuleOptions } from '@nestjs/graphql';
 import { distCandidates, findDistFile } from './dist-layout';
+import { wrapPreservingCause } from '../wrap-error';
 
 export const CONFIG_BASENAME = 'graphql.config.js';
 export const APP_MODULE_BASENAME = 'app.module.js';
@@ -152,16 +153,14 @@ export function resolveConfig(distRoot: string, schemaName: string): SchemaConfi
   try {
     mod = require(found);
   } catch (err) {
-    // Preserve the original error as `cause` rather than flattening it to a
-    // message fragment: the message alone drops the stack that says *which*
-    // line of the user's config blew up. Same technique, and same lib target,
-    // as ../emitter/preview.ts's augmentPreviewBootError.
-    const original = err instanceof Error ? err : new Error(String(err));
-    const augmented = new Error(
-      `Failed to load GraphQL schema config at ${found}: ${original.message}`,
-    );
-    (augmented as Error & { cause?: unknown }).cause = original;
-    throw augmented;
+    // A throwing config is one of the most common failures here, and the
+    // interesting frame is always in the user's file, never in ours.
+    // `wrapPreservingCause` keeps `cause` *and* merges the original stack —
+    // the latter being the part that survives `EmitFailure`'s JSON boundary
+    // (see ../emitter/protocol.ts, which carries no `cause` field), so
+    // without it the user is handed a stack pointing straight at this
+    // function.
+    throw wrapPreservingCause(`Failed to load GraphQL schema config at ${found}`, err);
   }
 
   const schemas = mod.schemas ?? mod.default?.schemas;

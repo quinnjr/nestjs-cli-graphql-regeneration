@@ -6,7 +6,7 @@
  * `console.log` reachable at require time — a config banner, `dotenv`'s debug
  * output, an ORM deprecation notice — lands in the same stream. Parsing the
  * whole stream as JSON then fails, turning an accurate diagnostic into
- * "Emitter produced no usable output."
+ * ../emitter/spawn.ts's "Emitter produced no usable output" rejection.
  *
  * A dedicated descriptor makes the payload structurally unmixable with user
  * output, and lets the parent inherit stdout so the user's own logging still

@@ -41,6 +41,37 @@ describe('harvest', () => {
     expect(resolvers).toEqual([RecipesResolver]);
   });
 
+  it('collects a bare @Resolver() whose metadata value is undefined', () => {
+    // `@Resolver()` with no argument is legal and common — it is how you write
+    // a resolver class that only carries @Query/@Mutation methods. Upstream's
+    // `addResolverMetadata` does `SetMetadata(RESOLVER_TYPE_METADATA,
+    // resolver || name)` with both undefined, so the key is *defined* with the
+    // value `undefined`: `hasMetadata` is true, `getMetadata` is falsy. A
+    // truthiness test therefore silently dropped the class, while the boot
+    // path (`ResolversExplorerService.getAllCtors`, which applies no metadata
+    // filter at all) kept it — observed as boot emitting `hello` + `recipes`
+    // and this path emitting only `recipes`.
+    //
+    // Uses the real decorator rather than a hand-rolled defineMetadata, so
+    // this stays pinned to what `@Resolver()` actually writes.
+    const { Resolver } = require('@nestjs/graphql');
+
+    @Resolver()
+    class BareResolver {}
+
+    @Resolver(() => String)
+    class TypedResolver {}
+
+    class AppModule {}
+
+    expect(Reflect.getMetadata(RESOLVER_TYPE_METADATA, BareResolver)).toBeUndefined();
+    expect(Reflect.hasMetadata(RESOLVER_TYPE_METADATA, BareResolver)).toBe(true);
+
+    const { resolvers } = harvest(containerOf(moduleOf(AppModule, BareResolver, TypedResolver)));
+
+    expect(resolvers).toEqual([BareResolver, TypedResolver]);
+  });
+
   it('collects scalars separately and skips null metatypes', () => {
     class DateScalar {}
     class AppModule {}
