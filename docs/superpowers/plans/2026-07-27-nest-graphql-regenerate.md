@@ -573,6 +573,18 @@ describe('serialize', () => {
     expect(out).toContain('replaced');
     expect(out).not.toContain('a: String');
   });
+
+  // Pins the ORDER of transform vs sort, which the isolated tests above cannot.
+  // Upstream transforms first, then sorts the transformed schema. Sorting first
+  // would still pass every other test here while producing different bytes.
+  it('sorts the transformed schema, not the original', async () => {
+    const out = await serialize(schemaWithFields('alpha', 'zeta'), {
+      sortSchema: true,
+      // Renames into an order that is NOT the original's alphabetical order.
+      transformSchema: () => schemaWithFields('yy', 'xx'),
+    });
+    expect(out.indexOf('xx')).toBeLessThan(out.indexOf('yy'));
+  });
 });
 ```
 
@@ -585,8 +597,14 @@ Expected: FAIL — `Cannot find module '../src/emitter/serialize'`
 
 Create `src/emitter/serialize.ts`:
 
+Use a **static import** for the two constants, not `require()`. Both resolve to the identical installed file at runtime — `@nestjs/graphql`'s `"./*": "./*"` exports wildcard permits the subpath, and a matching `.d.ts` ships beside `graphql.constants.js` — but the static form verifies the export names at compile time. With `require()`, an upstream rename yields `undefined`, and `undefined + printSchema(...)` silently emits SDL beginning with the literal text `undefined` instead of throwing.
+
 ```ts
 import { GraphQLSchema, lexicographicSortSchema, printSchema } from 'graphql';
+import {
+  GRAPHQL_SDL_FILE_HEADER,
+  GRAPHQL_SDL_FILE_END,
+} from '@nestjs/graphql/dist/graphql.constants';
 
 export interface SerializeOptions {
   sortSchema?: boolean;
@@ -598,17 +616,18 @@ export async function serialize(
   schema: GraphQLSchema,
   opts: SerializeOptions,
 ): Promise<string> {
-  const constants = require('@nestjs/graphql/dist/graphql.constants');
   const transformed = opts.transformSchema ? await opts.transformSchema(schema) : schema;
 
   let out =
-    constants.GRAPHQL_SDL_FILE_HEADER +
+    GRAPHQL_SDL_FILE_HEADER +
     printSchema(opts.sortSchema ? lexicographicSortSchema(transformed) : transformed);
 
-  if (opts.addNewlineAtEnd) out += constants.GRAPHQL_SDL_FILE_END;
+  if (opts.addNewlineAtEnd) out += GRAPHQL_SDL_FILE_END;
   return out;
 }
 ```
+
+This sequence is byte-for-byte identical to `GraphQLSchemaBuilder.generateSchema()` in `node_modules/@nestjs/graphql/dist/graphql-schema.builder.js` — transform, then sort the transformed schema, then print, then prepend the header, then conditionally append the trailer. Verified by direct source comparison during review. Any reordering breaks parity.
 
 - [ ] **Step 4: Run test to verify it passes**
 
