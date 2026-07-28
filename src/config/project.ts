@@ -17,6 +17,11 @@ export function resolveProject(
         `Unknown project "${projectName}". Available: ${Object.keys(projects).join(', ') || '(none)'}`,
       );
     }
+    if (!project.sourceRoot) {
+      throw new Error(
+        `Project "${projectName}" is missing required field "sourceRoot"`,
+      );
+    }
     const root = project.root ?? '';
     return {
       sourceRoot: project.sourceRoot,
