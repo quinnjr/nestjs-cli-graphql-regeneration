@@ -3,6 +3,22 @@ import { NodeModulesEngineHost } from '@angular-devkit/schematics/tools';
 import { SchematicEngine, Tree } from '@angular-devkit/schematics';
 import * as path from 'path';
 
+// The Rule under test (Task 9) really builds and really spawns the emitter. Those are covered
+// end to end elsewhere (test/regenerate.spec.ts, test/parity.spec.ts); here we only need the
+// Rule to run to completion so this test can keep proving what it always proved: that every
+// property `nest g` injects survives schema validation and the factory actually executes.
+jest.mock('../src/emitter/spawn', () => ({
+  spawnEmitter: jest.fn().mockResolvedValue({
+    ok: true,
+    sdl: 'type Query {\n  ok: String\n}\n',
+    outFile: 'src/schema.gql',
+  }),
+}));
+
+jest.mock('../src/regenerate/build-project', () => ({
+  buildProject: jest.fn().mockResolvedValue(undefined),
+}));
+
 const collectionPath = path.join(__dirname, '..', 'src', 'collection.json');
 const distCollectionPath = path.join(__dirname, '..', 'dist', 'collection.json');
 const closedSchemaFixturePath = path.join(
@@ -16,7 +32,10 @@ describe('regenerate schematic registration', () => {
   it('accepts every option nest g injects and runs the Rule', async () => {
     const runner = new SchematicTestRunner('nest-graphql', collectionPath);
     const tree = Tree.empty();
-    tree.create('/nest-cli.json', '{"sourceRoot":"src"}');
+    tree.create(
+      '/nest-cli.json',
+      JSON.stringify({ sourceRoot: 'src', projects: { api: { sourceRoot: 'src' } } }),
+    );
 
     const logEntries: string[] = [];
     const subscription = runner.logger.subscribe((entry) => logEntries.push(entry.message));
@@ -51,8 +70,8 @@ describe('regenerate schematic registration', () => {
     // Division of labor: this test only ever sends *declared* properties, so it cannot by
     // itself prove `additionalProperties` is absent from schema.json -- that is what the static
     // check below, plus the negative-control fixture test, verify directly.
-    expect(logEntries).toContain('regenerate: schema "default"');
-    expect(result.files).toEqual(['/nest-cli.json']);
+    expect(logEntries.join('\n')).toMatch(/Building project "api"/);
+    expect(result.files.sort()).toEqual(['/nest-cli.json', '/src/schema.gql']);
   });
 
   it('does not lock down additional properties', () => {
