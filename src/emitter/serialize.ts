@@ -1,5 +1,5 @@
 import { GraphQLSchema, lexicographicSortSchema, printSchema } from 'graphql';
-import { GRAPHQL_SDL_FILE_HEADER, GRAPHQL_SDL_FILE_END } from '@nestjs/graphql/dist/graphql.constants';
+import { GRAPHQL_SDL_FILE_HEADER, GRAPHQL_SDL_FILE_END } from '@nestjs/graphql/dist/graphql.constants.js';
 
 export interface SerializeOptions {
   sortSchema?: boolean;
