@@ -1,6 +1,6 @@
 import { Rule, SchematicContext, SchematicsException, Tree } from '@angular-devkit/schematics';
 import * as path from 'path';
-import { resolveProject } from '../config/project';
+import { resolveProject, ResolvedProject } from '../config/project';
 import { spawnEmitter } from '../emitter/spawn';
 import { buildProject } from './build-project';
 
@@ -20,8 +20,24 @@ export function regenerate(options: RegenerateOptions): Rule {
       );
     }
 
-    const nestCli = JSON.parse(nestCliBuffer.toString('utf8'));
-    const project = resolveProject(nestCli, options.project);
+    let nestCli: Record<string, any>;
+    try {
+      nestCli = JSON.parse(nestCliBuffer.toString('utf8'));
+    } catch (err) {
+      throw new SchematicsException(
+        `Could not parse nest-cli.json: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    let project: ResolvedProject;
+    try {
+      project = resolveProject(nestCli, options.project);
+    } catch (err) {
+      // resolveProject throws a plain Error; re-wrap so every failure in this Rule
+      // surfaces with the same SchematicsException framing.
+      throw new SchematicsException(err instanceof Error ? err.message : String(err));
+    }
+
     const projectRoot = process.cwd();
     const schemaName = options.name ?? 'default';
 
