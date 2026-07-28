@@ -877,145 +877,91 @@ git commit -m "feat: build SDL via preview-mode boot with byte parity proof"
 
 ---
 
-### Task 6: Read effective GqlModuleOptions from the preview container
+### Task 6: Config resolution
 
-> **Rewritten by the architecture pivot after Task 5.** This task originally loaded a user-authored `graphql.config.ts`, because `forRootAsync` factories were believed not to run under preview mode. A spike disproved that: the factory executes *and* resolves dependencies injected from modules preview never instantiated. The effective options are therefore readable straight from the container, and the config file is no longer required at all.
->
-> Spike results that govern this task (`autoSchemaFile` written?):
->
-> | style | `preview: true` | `preview: false` |
-> |---|---|---|
-> | `forRoot` | **yes** | yes |
-> | `forRootAsync` | **no** (silent) | yes |
->
-> Two consequences flow from that table. `forRootAsync` writing nothing under preview is why we keep building the schema ourselves rather than reading the boot's file. `forRoot` writing something is a **side effect we must suppress** — Task 7 owns that.
+> **Reverted to the original design after the pivot was falsified.** An intermediate version read options from the preview container. A spike disproved its premise: under preview, a `forRootAsync` factory *does* run, but any dependency injected from a non-allowlisted module arrives as `undefined`. A realistic `ConfigService` factory therefore throws `TypeError: Cannot read properties of undefined (reading 'get')` **inside `createApplicationContext` itself**, before any of our code runs. Reading options from the container is not viable for the dominant real-world pattern, so the config file returns.
+
+> Task 12 removes `GraphQLModule` from the preview allowlist, which is what stops that crash. This task supplies the options that removal costs us.
+
 
 **Files:**
-- Create: `src/config/options.ts`
-- Test: `test/options.spec.ts`
+- Create: `src/config/resolve.ts`
+- Test: `test/config.spec.ts`
 
 **Interfaces:**
-- Consumes: nothing (takes an already-created preview context)
+- Consumes: nothing
 - Produces:
-  - `interface EffectiveOptions { autoSchemaFile?: string; sortSchema?: boolean; addNewlineAtEnd?: boolean; buildSchemaOptions?: Record<string, unknown>; transformSchema?: (s: any) => any; include?: Function[] }`
-  - `readOptions(ctx: { get: (token: unknown, opts?: unknown) => unknown }): EffectiveOptions` — throws a clear error naming `GRAPHQL_MODULE_OPTIONS` when no `GraphQLModule` is present.
-  - `GRAPHQL_MODULE_OPTIONS_TOKEN: string`
-
-**Key facts for the implementer:**
-
-- The options object is registered under the token string **`"GqlModuleOptions"`** (verified in `node_modules/@nestjs/graphql/dist/graphql.constants.d.ts:14` — note it is *not* `"GraphQLModuleOptions"`). Import it statically as `GRAPHQL_MODULE_OPTIONS` from `@nestjs/graphql/dist/graphql.constants`, same reasoning as `serialize.ts`: a rename becomes a build error rather than a silent `undefined`.
-- `autoSchemaFile` is typed `AutoSchemaFileValue` — it may be a **string path**, `true` (in-memory only, nothing written), or an object `{ path?, federation? }`. Normalize all three. `@nestjs/graphql` has a `getPathForAutoSchemaFile` util for exactly this; prefer it over hand-rolling, and fall back to `undefined` when no path is derivable.
-- `buildSchemaOptions` on the module options is where `orphanedTypes`, `directives`, `scalarsMap`, `numberScalarMode`, `dateScalarMode`, and `addNewlineAtEnd` live. Pass the whole object through rather than cherry-picking fields; the emitter forwards it to `GraphQLSchemaFactory.create`.
-- `ctx.get(token, { strict: false })` is required — the options provider lives inside `GraphQLModule`, not the root module, so a strict lookup misses it.
+  - `interface SchemaConfig { autoSchemaFile: string; sortSchema?: boolean; addNewlineAtEnd?: boolean; buildSchemaOptions?: Record<string, unknown>; transformSchema?: (s: any) => any; include?: Function[] }`
+  - `resolveConfig(distRoot: string, schemaName: string): SchemaConfig` — throws with both attempted paths listed when not found.
+  - `CONFIG_BASENAME = 'graphql.config.js'`
 
 - [ ] **Step 1: Write the failing test**
 
-Create `test/options.spec.ts`. The first two tests use fake contexts (fast, no boot); the third is an integration test that proves the real thing works for `forRootAsync`, which is the case that motivated this rewrite.
+Create `test/config.spec.ts`:
 
 ```ts
-import 'reflect-metadata';
-import { Module, Injectable } from '@nestjs/common';
-import { GraphQLModule } from '@nestjs/graphql';
-import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
-import { NestFactory } from '@nestjs/core';
-import { join } from 'path';
-import { existsSync, rmSync } from 'fs';
-import { readOptions, GRAPHQL_MODULE_OPTIONS_TOKEN } from '../src/config/options';
-import { RecipesResolver } from './fixtures/basic/recipes.resolver';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import * as path from 'path';
+import { resolveConfig } from '../src/config/resolve';
 
-const ASYNC_SCHEMA = join(__dirname, 'fixtures', 'basic', 'options-async.gql');
-
-@Injectable()
-class Cfg {
-  readonly path = ASYNC_SCHEMA;
+function scratch(): string {
+  return mkdtempSync(path.join(tmpdir(), 'gqlcfg-'));
 }
 
-@Module({ providers: [Cfg], exports: [Cfg] })
-class CfgModule {}
+const CONFIG_JS = `
+module.exports.schemas = {
+  default: { autoSchemaFile: 'src/schema.gql', sortSchema: true },
+  admin: { autoSchemaFile: 'src/admin.gql' },
+};
+`;
 
-@Module({
-  imports: [
-    CfgModule,
-    GraphQLModule.forRootAsync<ApolloDriverConfig>({
-      driver: ApolloDriver,
-      imports: [CfgModule],
-      inject: [Cfg],
-      useFactory: (c: Cfg) => ({
-        autoSchemaFile: c.path,
-        sortSchema: true,
-        buildSchemaOptions: { addNewlineAtEnd: true },
-      }),
-    }),
-  ],
-  providers: [RecipesResolver],
-})
-class AsyncApp {}
-
-describe('readOptions', () => {
-  afterAll(() => {
-    if (existsSync(ASYNC_SCHEMA)) rmSync(ASYNC_SCHEMA);
+describe('resolveConfig', () => {
+  it('finds the config at the dist root', () => {
+    const dir = scratch();
+    writeFileSync(path.join(dir, 'graphql.config.js'), CONFIG_JS);
+    expect(resolveConfig(dir, 'default').autoSchemaFile).toBe('src/schema.gql');
   });
 
-  it('normalizes a string autoSchemaFile', () => {
-    const ctx = { get: () => ({ autoSchemaFile: 'src/schema.gql', sortSchema: true }) };
-    const opts = readOptions(ctx);
-    expect(opts.autoSchemaFile).toBe('src/schema.gql');
-    expect(opts.sortSchema).toBe(true);
+  it('falls back to a nested src directory', () => {
+    const dir = scratch();
+    mkdirSync(path.join(dir, 'src'));
+    writeFileSync(path.join(dir, 'src', 'graphql.config.js'), CONFIG_JS);
+    expect(resolveConfig(dir, 'admin').autoSchemaFile).toBe('src/admin.gql');
   });
 
-  it('normalizes the object form and yields undefined for the in-memory form', () => {
-    const objCtx = { get: () => ({ autoSchemaFile: { path: 'src/admin.gql' } }) };
-    expect(readOptions(objCtx).autoSchemaFile).toBe('src/admin.gql');
-
-    // `true` means "build in memory, write nothing" — there is no path to return.
-    const memCtx = { get: () => ({ autoSchemaFile: true }) };
-    expect(readOptions(memCtx).autoSchemaFile).toBeUndefined();
+  it('lists every attempted path when the config is missing', () => {
+    const dir = scratch();
+    expect(() => resolveConfig(dir, 'default')).toThrow(/graphql\.config\.js/);
+    expect(() => resolveConfig(dir, 'default')).toThrow(/src/);
   });
 
-  it('names the token when GraphQLModule is absent', () => {
-    const ctx = {
-      get: () => {
-        throw new Error('Nest could not find element');
-      },
-    };
-    expect(() => readOptions(ctx)).toThrow(/GqlModuleOptions/);
-  });
-
-  it('reads options a forRootAsync factory produced under preview mode', async () => {
-    const ctx = await NestFactory.createApplicationContext(AsyncApp, {
-      preview: true,
-      abortOnError: false,
-      logger: false,
-    });
-    try {
-      const opts = readOptions(ctx as any);
-      expect(opts.autoSchemaFile).toBe(ASYNC_SCHEMA);
-      expect(opts.sortSchema).toBe(true);
-      expect(opts.buildSchemaOptions).toEqual({ addNewlineAtEnd: true });
-    } finally {
-      await ctx.close();
-    }
+  it('names the missing schema key and the available ones', () => {
+    const dir = scratch();
+    writeFileSync(path.join(dir, 'graphql.config.js'), CONFIG_JS);
+    expect(() => resolveConfig(dir, 'nope')).toThrow(/nope/);
+    expect(() => resolveConfig(dir, 'nope')).toThrow(/default, admin/);
   });
 });
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `./node_modules/.bin/jest test/options.spec.ts`
-Expected: FAIL — `Cannot find module '../src/config/options'`
+Run: `pnpm test test/config.spec.ts`
+Expected: FAIL — `Cannot find module '../src/config/resolve'`
 
 - [ ] **Step 3: Write the implementation**
 
-Create `src/config/options.ts`:
+Create `src/config/resolve.ts`:
 
 ```ts
-import { GRAPHQL_MODULE_OPTIONS } from '@nestjs/graphql/dist/graphql.constants';
-import { getPathForAutoSchemaFile } from '@nestjs/graphql/dist/utils';
+import { existsSync } from 'fs';
+import * as path from 'path';
 
-export const GRAPHQL_MODULE_OPTIONS_TOKEN = GRAPHQL_MODULE_OPTIONS;
+export const CONFIG_BASENAME = 'graphql.config.js';
 
-export interface EffectiveOptions {
-  autoSchemaFile?: string;
+export interface SchemaConfig {
+  autoSchemaFile: string;
   sortSchema?: boolean;
   addNewlineAtEnd?: boolean;
   buildSchemaOptions?: Record<string, unknown>;
@@ -1023,54 +969,52 @@ export interface EffectiveOptions {
   include?: Function[];
 }
 
-export interface ContextLike {
-  get: (token: unknown, opts?: unknown) => unknown;
-}
+export function resolveConfig(distRoot: string, schemaName: string): SchemaConfig {
+  const candidates = [
+    path.join(distRoot, CONFIG_BASENAME),
+    path.join(distRoot, 'src', CONFIG_BASENAME),
+  ];
 
-export function readOptions(ctx: ContextLike): EffectiveOptions {
-  let raw: any;
-  try {
-    // strict: false — the provider lives inside GraphQLModule, not the root module.
-    raw = ctx.get(GRAPHQL_MODULE_OPTIONS, { strict: false });
-  } catch {
-    raw = undefined;
-  }
-
-  if (!raw) {
+  const found = candidates.find((c) => existsSync(c));
+  if (!found) {
     throw new Error(
-      `Could not read "${GRAPHQL_MODULE_OPTIONS}" from the application context. ` +
-        `Make sure the module you pointed at imports GraphQLModule.forRoot() or forRootAsync().`,
+      `Could not find a compiled ${CONFIG_BASENAME}. Looked in:\n` +
+        candidates.map((c) => `  - ${c}`).join('\n') +
+        `\nRun "nest build" first, and export a "schemas" object from graphql.config.ts.`,
     );
   }
 
-  return {
-    autoSchemaFile: getPathForAutoSchemaFile(raw.autoSchemaFile) || undefined,
-    sortSchema: raw.sortSchema,
-    addNewlineAtEnd: raw.buildSchemaOptions?.addNewlineAtEnd,
-    buildSchemaOptions: raw.buildSchemaOptions,
-    transformSchema: raw.transformAutoSchemaFile ? raw.transformSchema : undefined,
-    include: raw.include,
-  };
+  const mod = require(found);
+  const schemas = mod.schemas ?? mod.default?.schemas;
+  if (!schemas) {
+    throw new Error(`${found} does not export a "schemas" object.`);
+  }
+
+  const config = schemas[schemaName];
+  if (!config) {
+    throw new Error(
+      `No schema named "${schemaName}" in ${found}. Available: ${Object.keys(schemas).join(', ')}`,
+    );
+  }
+
+  return config;
 }
 ```
 
-Note `transformSchema` is only honoured when `transformAutoSchemaFile` is set — that is the exact gate `GraphQLSchemaBuilder.build()` applies, and copying it keeps byte-parity.
-
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `./node_modules/.bin/jest test/options.spec.ts`
+Run: `pnpm test test/config.spec.ts`
 Expected: PASS (4 tests)
-
-If `getPathForAutoSchemaFile` is not exported from `@nestjs/graphql/dist/utils`, find its real path with `grep -rn "getPathForAutoSchemaFile" node_modules/@nestjs/graphql/dist/ | head` and use that. Do not hand-roll the normalization — matching upstream is the point.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/config/options.ts test/options.spec.ts
-git commit -m "feat: read effective GqlModuleOptions from the preview container"
+git add src/config/resolve.ts test/config.spec.ts
+git commit -m "feat: resolve compiled graphql.config.js and named schemas"
 ```
 
 ---
+
 ### Task 7: Emitter child process
 
 Isolates the user's app from the CLI process and pins module resolution to the user's project.
@@ -1847,6 +1791,192 @@ Replace any Apollo-specific phrasing with an explicit statement of what is verif
 ```bash
 git add package.json pnpm-lock.yaml test/fixtures/mercurius test/parity-mercurius.spec.ts README.md
 git commit -m "test: prove byte parity against the Mercurius driver on Fastify"
+```
+
+---
+
+### Task 12: Harden the preview boot (remove GraphQLModule from the allowlist)
+
+> **Dispatch this immediately after Task 6 and before Task 7.** The ordinal is high only because inserting mid-plan would renumber later tasks and invalidate their briefs.
+
+**Why this exists.** `@nestjs/graphql` calls `InitializeOnPreviewAllowlist.add(GraphQLModule)` (`node_modules/@nestjs/graphql/dist/graphql.module.js:181`), which exempts `GraphQLModule` from preview mode's skip-initialization rule. Its `onModuleInit` therefore runs during our preview boot. Two consequences, both verified by spike:
+
+1. **It crashes on the dominant real-world config.** Under preview, a `forRootAsync` factory runs, but a dependency injected from a module preview did *not* instantiate arrives as `undefined`. A realistic `ConfigService` factory calling `cfg.get('...')` throws `TypeError: Cannot read properties of undefined (reading 'get')` **inside `NestFactory.createApplicationContext` itself** — before any of our code executes, so it cannot be caught and recovered from downstream.
+2. **It writes the user's schema file as a side effect,** at whatever path their module config names, regardless of what the CLI was asked to do. That alone would make `--dry-run` dishonest.
+
+Removing `GraphQLModule` from the allowlist fixes both, and resolver metatypes remain harvestable because they come from module *metadata* registered at import time, not from provider instantiation.
+
+Spike results with the removal applied, against a `forRootAsync` + method-calling `ConfigService` fixture:
+
+```
+delete() returned true, allowlisted after = false
+boot err        = none
+schema written  = false
+resolvers harvested = 1 (RecipesResolver)
+```
+
+**Files:**
+- Create: `src/emitter/preview.ts`
+- Modify: `src/emitter/build.ts` (use the new helper for the preview context)
+- Test: `test/preview.spec.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces: `createPreviewContext(appModule: unknown): Promise<INestApplicationContext>` and `suppressGraphQLModulePreviewInit(): boolean` (returns whether removal succeeded).
+
+**The fragility this introduces, and how to contain it.** `InitializeOnPreviewAllowlist` exposes only `add` and `has` — there is no public `delete`. The backing store is a `private static readonly allowlist` that is a `WeakMap` at runtime, so removal means reaching a TypeScript-private field. That is acceptable **only** with a guard test that fails loudly if the shape changes, exactly like the metadata-key pinning test in `harvest.ts`. Without the guard, an upstream rename would silently restore the crashing behaviour.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/preview.spec.ts`:
+
+```ts
+import 'reflect-metadata';
+import { Injectable, Module } from '@nestjs/common';
+import { GraphQLModule } from '@nestjs/graphql';
+import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
+import { ModulesContainer } from '@nestjs/core';
+import { InitializeOnPreviewAllowlist } from '@nestjs/core/inspector';
+import { join } from 'path';
+import { existsSync, rmSync } from 'fs';
+import { createPreviewContext } from '../src/emitter/preview';
+import { harvest } from '../src/emitter/harvest';
+import { RecipesResolver } from './fixtures/basic/recipes.resolver';
+
+const OUT = join(__dirname, 'fixtures', 'basic', 'preview-sideeffect.gql');
+
+@Injectable()
+class RealisticConfigService {
+  private readonly values = new Map([['SCHEMA', OUT]]);
+  // A method, not a field — this is the shape that crashes without the fix.
+  get(key: string): string {
+    return this.values.get(key)!;
+  }
+}
+
+@Module({ providers: [RealisticConfigService], exports: [RealisticConfigService] })
+class RealisticConfigModule {}
+
+@Module({
+  imports: [
+    RealisticConfigModule,
+    GraphQLModule.forRootAsync<ApolloDriverConfig>({
+      driver: ApolloDriver,
+      imports: [RealisticConfigModule],
+      inject: [RealisticConfigService],
+      useFactory: (cfg: RealisticConfigService) => ({
+        autoSchemaFile: cfg.get('SCHEMA'),
+        sortSchema: true,
+      }),
+    }),
+  ],
+  providers: [RecipesResolver],
+})
+class RealisticApp {}
+
+describe('createPreviewContext', () => {
+  afterEach(() => {
+    if (existsSync(OUT)) rmSync(OUT);
+  });
+
+  // GUARD: fails loudly if upstream changes the allowlist's private shape.
+  it('can still reach the allowlist internals it depends on', () => {
+    const store = (InitializeOnPreviewAllowlist as any).allowlist;
+    expect(store).toBeInstanceOf(WeakMap);
+    expect(typeof store.delete).toBe('function');
+    expect(typeof InitializeOnPreviewAllowlist.has).toBe('function');
+  });
+
+  it('boots an app whose forRootAsync factory calls a method on an injected dep', async () => {
+    // Without the fix this rejects with
+    // "TypeError: Cannot read properties of undefined (reading 'get')".
+    const ctx = await createPreviewContext(RealisticApp);
+    expect(ctx).toBeDefined();
+    await ctx.close();
+  });
+
+  it('does not write the module-configured schema file', async () => {
+    const ctx = await createPreviewContext(RealisticApp);
+    expect(existsSync(OUT)).toBe(false);
+    await ctx.close();
+  });
+
+  it('still exposes resolver metatypes for harvesting', async () => {
+    const ctx = await createPreviewContext(RealisticApp);
+    const { resolvers } = harvest(ctx.get(ModulesContainer) as any);
+    expect(resolvers).toContain(RecipesResolver);
+    await ctx.close();
+  });
+});
+```
+
+- [ ] **Step 2: Run to verify RED**
+
+Run: `./node_modules/.bin/jest test/preview.spec.ts`
+Expected: FAIL — `Cannot find module '../src/emitter/preview'`
+
+- [ ] **Step 3: Write the implementation**
+
+Create `src/emitter/preview.ts`:
+
+```ts
+import { INestApplicationContext } from '@nestjs/common';
+import { NestFactory } from '@nestjs/core';
+import { InitializeOnPreviewAllowlist } from '@nestjs/core/inspector';
+import { GraphQLModule } from '@nestjs/graphql';
+
+/**
+ * `@nestjs/graphql` allowlists GraphQLModule so it initializes even under
+ * preview mode. That is wrong for us on two counts: its options factory
+ * throws when it injects from a module preview did not instantiate, and its
+ * onModuleInit writes the user's schema file as a side effect.
+ *
+ * There is no public removal API, so this reaches the private WeakMap backing
+ * the allowlist. `test/preview.spec.ts` guards that shape.
+ */
+export function suppressGraphQLModulePreviewInit(): boolean {
+  const store = (InitializeOnPreviewAllowlist as unknown as {
+    allowlist?: WeakMap<object, boolean>;
+  }).allowlist;
+
+  if (!(store instanceof WeakMap)) return false;
+  return store.delete(GraphQLModule as unknown as object);
+}
+
+export async function createPreviewContext(
+  appModule: unknown,
+): Promise<INestApplicationContext> {
+  suppressGraphQLModulePreviewInit();
+
+  return NestFactory.createApplicationContext(appModule as any, {
+    preview: true,
+    abortOnError: false,
+    logger: false,
+  });
+}
+```
+
+- [ ] **Step 4: Run to verify GREEN**
+
+Run: `./node_modules/.bin/jest test/preview.spec.ts`
+Expected: PASS (4 tests)
+
+- [ ] **Step 5: Route `build.ts` through the helper**
+
+In `src/emitter/build.ts`, replace the inline `NestFactory.createApplicationContext(appModule, { preview: true, ... })` call with `createPreviewContext(appModule)`. Change nothing else — the harvest, factory, and serialize sequence stays exactly as it is.
+
+- [ ] **Step 6: Run the full suite**
+
+Run: `pnpm test`
+Expected: everything passes, output pristine. **The Task 5 byte-parity test must still pass** — that is the check that matters most here. If it now fails, the suppression changed what gets built and you must report it rather than adjust the assertion.
+
+Note the Task 5 parity test boots its fixture for real to get ground truth, which is unaffected by preview-mode behaviour. Only the `buildSdl` half changes.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/emitter/preview.ts src/emitter/build.ts test/preview.spec.ts
+git commit -m "fix: keep GraphQLModule from initializing during the preview boot"
 ```
 
 ---
