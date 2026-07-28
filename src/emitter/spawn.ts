@@ -27,10 +27,27 @@ function resolveChildEntry(): string {
   return found;
 }
 
-export function spawnEmitter(req: EmitRequest): Promise<EmitSuccess> {
-  const childEntry = resolveChildEntry();
+// Guards against a parseable-but-wrong-shaped blob silently producing
+// `reject(new Error(undefined))` — i.e. a rejection whose message is the
+// literal string "undefined".
+function isEmitResult(x: unknown): x is EmitSuccess | EmitFailure {
+  if (!x || typeof x !== 'object') return false;
+  const r = x as Record<string, unknown>;
+  if (r.ok === true) return typeof r.sdl === 'string' && typeof r.outFile === 'string';
+  if (r.ok === false) return typeof r.message === 'string';
+  return false;
+}
 
+export function spawnEmitter(req: EmitRequest): Promise<EmitSuccess> {
+  // Resolving the child entry can throw (see resolveChildEntry above). Doing
+  // that inside the executor — rather than before `return new Promise(...)` —
+  // matters: a synchronous throw from a Promise executor is automatically
+  // turned into a rejection by the Promise constructor itself, so callers
+  // chaining `.catch()` off spawnEmitter() always see a rejection, never an
+  // exception, honoring the documented `Promise<EmitSuccess>` contract.
   return new Promise((resolve, reject) => {
+    const childEntry = resolveChildEntry();
+
     const child = spawn(
       process.execPath,
       ['-r', 'reflect-metadata', childEntry, JSON.stringify(req)],
@@ -44,17 +61,33 @@ export function spawnEmitter(req: EmitRequest): Promise<EmitSuccess> {
       },
     );
 
+    // If the child never launches at all (EACCES, ENOENT on cwd, resource
+    // exhaustion, ...), Node emits 'error' on the ChildProcess. Without a
+    // listener, an unhandled 'error' event throws and crashes *this*
+    // process — exactly the blast-containment failure this task exists to
+    // prevent. 'error' is also not guaranteed to be followed by 'close', so
+    // the JSON-parse fallback below cannot be relied on to catch this case.
+    child.on('error', (err) => {
+      reject(new Error(`Failed to spawn emitter child process: ${err.message}`));
+    });
+
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => (stdout += d.toString()));
     child.stderr.on('data', (d) => (stderr += d.toString()));
 
     child.on('close', () => {
-      let parsed: EmitSuccess | EmitFailure;
+      let parsed: unknown;
       try {
         parsed = JSON.parse(stdout.trim());
       } catch {
         reject(new Error(`Emitter produced no usable output.\n${stderr || stdout}`));
+        return;
+      }
+      if (!isEmitResult(parsed)) {
+        reject(
+          new Error(`Emitter produced unexpected output: ${stdout.trim()}\n${stderr}`),
+        );
         return;
       }
       if (parsed.ok) resolve(parsed);
