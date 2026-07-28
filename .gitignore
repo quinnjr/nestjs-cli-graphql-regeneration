@@ -1,3 +1,5 @@
 dist/
 node_modules/
 test/fixtures-dist/
+test/fixtures/basic/*.gql
+test/fixtures/exploding/*.gql

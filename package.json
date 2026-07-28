@@ -27,6 +27,7 @@
     "@nestjs/core": "^11.1.28",
     "@nestjs/graphql": "^13.4.2",
     "@nestjs/apollo": "^13.4.2",
+    "@as-integrations/express5": "^1.1.2",
     "@nestjs/platform-express": "^11.1.28",
     "@nestjs/schematics": "^11.1.0",
     "@apollo/server": "^5.5.1",
