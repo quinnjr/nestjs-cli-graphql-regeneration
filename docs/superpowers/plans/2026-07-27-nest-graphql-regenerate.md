@@ -240,6 +240,12 @@ describe('regenerate schematic registration', () => {
 });
 ```
 
+> **Superseded during review.** `expect(result).toBeDefined()` is too weak to be the guard this test needs: `runSchematic` returns something defined in every non-throwing case, so the assertion is not what protects option tolerance — an unhandled schema-validation rejection is, invisibly. If validation were ever skipped (a typo in `collection.json`'s `schema` path, say) this test would keep passing while verifying nothing.
+>
+> Replace it with assertions against the schematic's observable effect, and add a **negative control**: a deliberately closed schema (`additionalProperties: false`) receiving an undeclared property, asserted to reject. A guard test never observed failing is not yet a guard.
+>
+> Steps 3-9 below are unchanged; the committed suite also adds the two `extends`-chain proofs described in Step 7a.
+
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pnpm test test/collection.spec.ts`
@@ -320,6 +326,15 @@ export function regenerate(options: RegenerateOptions): Rule {
 
 Run: `pnpm test test/collection.spec.ts`
 Expected: PASS
+
+- [ ] **Step 7a: Commit both `extends`-chain proofs as real tests**
+
+De-risking the `extends` chain is why this task runs before any product logic, so the proofs must live in the suite rather than in a report. Ad-hoc `node -e` verification leaves nothing guarding a regression.
+
+1. Resolve a schematic **native to `@nestjs/schematics`** (e.g. `service`) through our collection object — `collection.createSchematic('service')` or equivalent. Asserting that the `extends` key exists in JSON does **not** count; that tests the file, not the engine.
+2. Load the compiled `dist/collection.json` through the real `NodeModulesEngineHost`, exercising the CommonJS `require()` path production uses.
+
+Add `"pretest": "pnpm build"` to `package.json` so (2) is reproducible. Task 7 extends that same script with fixture compilation.
 
 - [ ] **Step 7: Add a regression test for the `additionalProperties` trap**
 
