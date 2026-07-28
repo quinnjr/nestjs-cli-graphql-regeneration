@@ -1,4 +1,5 @@
 import { GraphQLSchema, lexicographicSortSchema, printSchema } from 'graphql';
+import { GRAPHQL_SDL_FILE_HEADER, GRAPHQL_SDL_FILE_END } from '@nestjs/graphql/dist/graphql.constants';
 
 export interface SerializeOptions {
   sortSchema?: boolean;
@@ -10,13 +11,12 @@ export async function serialize(
   schema: GraphQLSchema,
   opts: SerializeOptions,
 ): Promise<string> {
-  const constants = require('@nestjs/graphql/dist/graphql.constants');
   const transformed = opts.transformSchema ? await opts.transformSchema(schema) : schema;
 
   let out =
-    constants.GRAPHQL_SDL_FILE_HEADER +
+    GRAPHQL_SDL_FILE_HEADER +
     printSchema(opts.sortSchema ? lexicographicSortSchema(transformed) : transformed);
 
-  if (opts.addNewlineAtEnd) out += constants.GRAPHQL_SDL_FILE_END;
+  if (opts.addNewlineAtEnd) out += GRAPHQL_SDL_FILE_END;
   return out;
 }
