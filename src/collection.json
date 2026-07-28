@@ -1,0 +1,12 @@
+{
+  "$schema": "../node_modules/@angular-devkit/schematics/collection-schema.json",
+  "extends": ["@nestjs/schematics"],
+  "schematics": {
+    "regenerate": {
+      "description": "Regenerate the GraphQL schema file without booting the application",
+      "factory": "./regenerate/index#regenerate",
+      "schema": "./regenerate/schema.json",
+      "aliases": ["gql-regen"]
+    }
+  }
+}
