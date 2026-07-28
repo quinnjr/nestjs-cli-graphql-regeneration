@@ -8,6 +8,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && pnpm copy:meta",
     "copy:meta": "node -e \"const{cpSync,existsSync,mkdirSync}=require('fs');for(const[s,d]of[['src/collection.json','dist/collection.json'],['src/regenerate/schema.json','dist/regenerate/schema.json']]){if(!existsSync(s))continue;mkdirSync(require('path').dirname(d),{recursive:true});cpSync(s,d)}\"",
+    "pretest": "pnpm build",
     "test": "jest",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
   },

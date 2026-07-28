@@ -1,0 +1,10 @@
+{
+  "$schema": "../../../node_modules/@angular-devkit/schematics/collection-schema.json",
+  "schematics": {
+    "closed": {
+      "description": "Negative-control fixture: schema.json below sets additionalProperties: false, to prove the test harness can actually observe a schema-validation rejection.",
+      "factory": "./factory#closed",
+      "schema": "./schema.json"
+    }
+  }
+}
