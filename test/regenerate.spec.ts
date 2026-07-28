@@ -1,6 +1,15 @@
 import { SchematicTestRunner } from '@angular-devkit/schematics/testing';
 import { Tree } from '@angular-devkit/schematics';
 import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
+import type { ChildProcess } from 'child_process';
+// Plain `require`, not `import * as`: TypeScript's ES-module interop helper wraps a
+// `import * as ns from 'child_process'` namespace in a new, frozen object, which
+// `jest.spyOn` cannot redefine properties on ("Cannot redefine property: spawn"). A plain
+// `require` returns Node's real (shared, singleton) module object, matching what
+// build-project.ts's own compiled `require('child_process')` call resolves to.
+const childProcess = require('child_process') as typeof import('child_process');
 
 jest.mock('../src/emitter/spawn', () => ({
   spawnEmitter: jest.fn().mockResolvedValue({
@@ -134,5 +143,72 @@ describe('regenerate', () => {
     await expect(
       runner.runSchematic('regenerate', { name: 'default', project: 'ghost' }, tree),
     ).rejects.toThrow(/Unknown project "ghost"/);
+  });
+});
+
+// `buildProject` is mocked (above) for every test in the `regenerate` describe block --
+// deliberately, per the brief: this task tests orchestration and Tree writes, not process-
+// spawning mechanics. These tests exercise the *real*, unmocked `buildProject` directly
+// (via `jest.requireActual`, which bypasses the `jest.mock` call at the top of this file)
+// to prove the shell-injection fix and its consequences: no shell on any platform, no
+// `npx`, a validated project name, and an actionable message when the target project
+// doesn't have `@nestjs/cli` installed.
+describe('buildProject (real implementation)', () => {
+  const { buildProject: realBuildProject } = jest.requireActual('../src/regenerate/build-project');
+
+  it('spawns node directly against the resolved nest CLI bin, with no shell and no npx', async () => {
+    // @nestjs/cli is not (and must not become, per this task's "no dependency changes"
+    // constraint) an actual dependency of this package, so a real installed copy isn't
+    // available to resolve against. Build a throwaway fake project root with just enough
+    // of a node_modules layout for `require.resolve(..., { paths: [projectRoot] })` to
+    // find a real file, so the resolution the implementation performs is genuinely
+    // exercised rather than mocked away.
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'regenerate-build-project-'));
+    const binDir = path.join(tempRoot, 'node_modules', '@nestjs', 'cli', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const nestBin = path.join(binDir, 'nest.js');
+    fs.writeFileSync(nestBin, '// stub nest CLI bin for tests\n');
+
+    // child_process is a Node built-in (a singleton module instance regardless of which
+    // file calls `require('child_process')`), so spying on it here intercepts the exact
+    // same `spawn` reference build-project.ts holds.
+    const spawnSpy = jest.spyOn(childProcess, 'spawn').mockReturnValue({
+      on: (event: string, cb: (code: number | null) => void) => {
+        if (event === 'close') cb(0);
+      },
+    } as unknown as ChildProcess);
+
+    try {
+      await realBuildProject(tempRoot, 'api');
+
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+      const [command, args, options] = spawnSpy.mock.calls[0];
+      expect(command).toBe(process.execPath);
+      expect(args).toEqual([nestBin, 'build', 'api']);
+      expect((options as Record<string, unknown>).shell).toBeUndefined();
+      expect((options as Record<string, unknown>).cwd).toBe(tempRoot);
+    } finally {
+      spawnSpy.mockRestore();
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a project name containing shell metacharacters before spawning anything', async () => {
+    const spawnSpy = jest.spyOn(childProcess, 'spawn');
+
+    try {
+      await expect(realBuildProject(process.cwd(), 'evil; rm -rf /')).rejects.toThrow(
+        /Invalid project name/,
+      );
+      expect(spawnSpy).not.toHaveBeenCalled();
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('rejects with an actionable message when @nestjs/cli is not resolvable from the project', async () => {
+    // This repo's own root is real ambient state for this case: the package only
+    // peer-depends on @nestjs/schematics, and @nestjs/cli is genuinely not installed here.
+    await expect(realBuildProject(process.cwd())).rejects.toThrow(/@nestjs\/cli/);
   });
 });
