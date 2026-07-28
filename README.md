@@ -1,9 +1,9 @@
-# @scope/nest-graphql
+# nestjs-graphql-regenerate
 
 Regenerate a NestJS code-first GraphQL schema without booting your app — no
 database, no Redis, no secrets.
 
-`@scope/nest-graphql` is a [`nest g`](https://docs.nestjs.com/cli/overview)
+`nestjs-graphql-regenerate` is a [`nest g`](https://docs.nestjs.com/cli/overview)
 schematic collection. It boots your application in Nest's **preview mode**
 (the same mode `nest info`-style tooling uses to walk the module graph
 without instantiating providers), harvests your resolvers and scalars, builds
@@ -13,7 +13,7 @@ result to disk — all in a child process, driven by the CLI you already use.
 ## Install
 
 ```bash
-pnpm add -D @scope/nest-graphql
+pnpm add -D nestjs-graphql-regenerate
 ```
 
 ## Requirements
@@ -52,7 +52,7 @@ alongside this package:
 ## Use
 
 ```bash
-nest g -c @scope/nest-graphql regenerate
+nest g -c nestjs-graphql-regenerate regenerate
 ```
 
 Optionally set the collection as your default in `nest-cli.json` to drop the
@@ -60,7 +60,7 @@ Optionally set the collection as your default in `nest-cli.json` to drop the
 `nest g resource`, and friends keep working unmodified:
 
 ```json
-{ "collection": "@scope/nest-graphql" }
+{ "collection": "nestjs-graphql-regenerate" }
 ```
 
 ```bash
@@ -68,7 +68,7 @@ nest g regenerate
 ```
 
 The schematic is also registered under the alias `gql-regen` — swap it in
-for `regenerate` in either invocation above (`nest g -c @scope/nest-graphql
+for `regenerate` in either invocation above (`nest g -c nestjs-graphql-regenerate
 gql-regen`, or `nest g gql-regen` once the collection is your default) for
 anyone who'd rather not type the whole word.
 
@@ -260,7 +260,7 @@ exit code at all:
 ```json
 {
   "scripts": {
-    "gql:gen": "nest g -c @scope/nest-graphql regenerate",
+    "gql:gen": "nest g -c nestjs-graphql-regenerate regenerate",
     "gql:check": "pnpm gql:gen && git diff --exit-code -- '*.gql'"
   }
 }

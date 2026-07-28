@@ -1,5 +1,5 @@
 {
-  "name": "@scope/nest-graphql",
+  "name": "nestjs-graphql-regenerate",
   "version": "0.1.0",
   "description": "Regenerate a NestJS code-first GraphQL schema without booting the app",
   "license": "MIT",
