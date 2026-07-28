@@ -1,0 +1,58 @@
+{
+  "name": "@scope/nest-graphql",
+  "version": "0.1.0",
+  "description": "Regenerate a NestJS code-first GraphQL schema without booting the app",
+  "license": "MIT",
+  "schematics": "./dist/collection.json",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && pnpm copy:meta",
+    "copy:meta": "node -e \"const{cpSync,existsSync,mkdirSync}=require('fs');for(const[s,d]of[['src/collection.json','dist/collection.json'],['src/regenerate/schema.json','dist/regenerate/schema.json']]){if(!existsSync(s))continue;mkdirSync(require('path').dirname(d),{recursive:true});cpSync(s,d)}\"",
+    "pretest": "pnpm build && tsc test/fixtures/basic/*.ts test/fixtures/exploding/*.ts --outDir test/fixtures-dist --rootDir test/fixtures --module commonjs --target ES2021 --experimentalDecorators --emitDecoratorMetadata --esModuleInterop --skipLibCheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@angular-devkit/core": "19.2.24",
+    "@angular-devkit/schematics": "19.2.24"
+  },
+  "peerDependencies": {
+    "@nestjs/common": ">=10",
+    "@nestjs/core": ">=10",
+    "@nestjs/graphql": ">=12.2.0",
+    "@nestjs/schematics": ">=10"
+  },
+  "devDependencies": {
+    "@apollo/server": "^5.5.1",
+    "@as-integrations/express5": "^1.1.2",
+    "@nestjs/apollo": "^13.4.2",
+    "@nestjs/common": "^11.1.28",
+    "@nestjs/core": "^11.1.28",
+    "@nestjs/graphql": "^13.4.2",
+    "@nestjs/mercurius": "^13.4.2",
+    "@nestjs/platform-express": "^11.1.28",
+    "@nestjs/platform-fastify": "^11.1.28",
+    "@nestjs/schematics": "^11.1.0",
+    "@swc/core": "^1.15.46",
+    "@types/node": "^20.16.0",
+    "fastify": "^5.2.1",
+    "graphql": "^16.11.0",
+    "mercurius": "^16.0.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "typescript": "^5.5.4",
+    "unplugin-swc": "^1.5.9",
+    "vitest": "^4.1.10"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.13.0",
+      "onFail": "download"
+    }
+  }
+}

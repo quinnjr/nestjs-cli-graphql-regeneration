@@ -1,0 +1,5 @@
+allowBuilds:
+  '@apollo/protobufjs': true
+  # SWC ships a native binding; its build step links the platform binary.
+  # Without it, unplugin-swc cannot load and the test transform fails outright.
+  '@swc/core': true

@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/schema",
+  "$id": "NestGraphqlRegenerate",
+  "title": "Regenerate GraphQL schema",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Named schema from graphql.config to regenerate.",
+      "default": "default"
+    },
+    "path": { "type": "string", "description": "Ignored; accepted for nest g compatibility." },
+    "project": { "type": "string", "description": "Nest monorepo project name." },
+    "sourceRoot": { "type": "string", "description": "Source root injected by nest g." },
+    "collection": { "type": "string" },
+    "skipImport": { "type": "boolean" },
+    "type": { "type": "string" },
+    "crud": { "type": "boolean" },
+    "language": { "type": "string" },
+    "spec": { "type": "boolean" },
+    "flat": { "type": "boolean" },
+    "specFileSuffix": { "type": "string" }
+  },
+  "required": []
+}

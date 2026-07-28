@@ -1,0 +1,16 @@
+{
+  // ts-jest type-checked every test file as a side effect of running them.
+  // Vitest does not: SWC strips types without checking them, so a type error in
+  // a spec would now pass silently. This config restores that coverage as an
+  // explicit `pnpm typecheck` step -- it emits nothing and exists only to fail.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    // `globals: true` in vitest.config.ts puts describe/it/expect/vi on the
+    // global object; this is what tells TypeScript about them.
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist", "test/fixtures-dist"]
+}
