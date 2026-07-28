@@ -1,6 +1,7 @@
 import { GraphQLSchema } from 'graphql';
 import { harvest, ContainerLike } from './harvest';
 import { serialize, SerializeOptions } from './serialize';
+import { createPreviewContext } from './preview';
 
 export interface BuildSdlOptions extends SerializeOptions {
   buildSchemaOptions?: Record<string, unknown>;
@@ -15,11 +16,7 @@ export async function buildSdl(
   const { GraphQLSchemaBuilderModule, GraphQLSchemaFactory } = require('@nestjs/graphql');
 
   // Preview mode: module graph is built, providers are never constructed.
-  const previewCtx = await NestFactory.createApplicationContext(appModule, {
-    preview: true,
-    abortOnError: false,
-    logger: false,
-  });
+  const previewCtx = await createPreviewContext(appModule);
 
   let sdl: string;
   try {
