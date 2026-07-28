@@ -16,6 +16,32 @@ result to disk — all in a child process, driven by the CLI you already use.
 pnpm add -D @scope/nest-graphql
 ```
 
+## Requirements
+
+Install these in the **project you're generating a schema for**, not just
+alongside this package:
+
+- **`@nestjs/cli` as a local dependency** — e.g. `pnpm add -D @nestjs/cli`.
+  Many Nest projects only have a *globally* installed `nest` command; that's
+  not enough. `regenerate` runs `nest build` by resolving your project's own
+  installed CLI (`require.resolve('@nestjs/cli/bin/nest.js', { paths:
+  [projectRoot] })` — see `src/regenerate/build-project.ts`), not by
+  shelling out to whatever `nest`/`npx` happens to be on your `PATH`. If it
+  can't find a local install, you'll see exactly this before anything else
+  runs:
+
+  ```
+  Could not find "@nestjs/cli" from "<projectRoot>". This package only
+  peer-depends on @nestjs/schematics; the Nest CLI itself must be installed
+  in your project (e.g. "npm install --save-dev @nestjs/cli") to run "nest
+  build".
+  ```
+
+- `@nestjs/common`, `@nestjs/core` (`>=10`), `@nestjs/graphql` (`>=12`), and
+  `@nestjs/schematics` (`>=10`) — declared as peer dependencies. Whatever
+  your application already depends on satisfies these; nothing extra to add
+  for a typical Nest + GraphQL project.
+
 ## Use
 
 ```bash
@@ -62,15 +88,23 @@ import { schemas } from './graphql.config';
 GraphQLModule.forRoot({ driver: ApolloDriver, ...schemas.default });
 ```
 
-**This is required, not stylistic — not merely a style preference.** Nest's
-preview mode does run a `forRootAsync` factory (it isn't skipped), but any
-dependency your factory injects from a module preview mode did not
-instantiate arrives as `undefined`. A factory that calls a method on that
-dependency (`cfg.get('SCHEMA')`, for example) throws before the schema can be
-built. There is no reliable way to recover your `GqlModuleOptions` from the
-container in the general case, so the shared config object is the one
-channel this tool can depend on. A default export shape
-(`export default { schemas: {...} }`) also works.
+**This is required, not merely a style preference.** We deliberately prevent
+`GraphQLModule` from initializing during the preview boot this tool uses
+(`src/emitter/preview.ts`), because letting it run would both crash on
+common `forRootAsync` configurations and write your schema file to disk as
+a side effect of just walking the module graph — a factory that injects a
+dependency from a module preview mode never instantiated, then calls a
+method on it, throws on `undefined`. Since `GraphQLModule` never
+initializes during preview, its options are never constructed, so there is
+nothing in the container to read them from. The exported config object is
+the only reliable channel.
+
+If suppression itself ever fails — for example, against a future
+`@nestjs/core` release that changes the private internals it relies on —
+this tool warns on stderr and falls back to the older behavior (the
+crash-on-undefined-dependency failure mode described above becomes possible
+again) rather than failing silently; see `test/preview.spec.ts`. A default
+export shape (`export default { schemas: {...} }`) also works.
 
 If the compiled config can't be found, or doesn't export the requested
 schema name, the error names every path that was checked and every schema
@@ -198,10 +232,3 @@ instead:
 ```
 
 (Requires `chokidar-cli` as a dev dependency.)
-
-## Not supported
-
-- **Apollo Federation / Mercurius federation.** Federated schemas are built
-  via `buildSubgraphSchema`, a different path than the one this tool
-  exercises. Out of scope.
-- **`--watch` via `nest g`.** See above; use a watcher process instead.
