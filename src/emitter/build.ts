@@ -77,6 +77,20 @@ export async function buildSdl(
         dedupeAgainstUserScalars(scalars, opts.buildSchemaOptions),
         {
           ...(opts.buildSchemaOptions ?? {}),
+          // The outer spread copies the options object, but not the nested
+          // `scalarsMap` array — a spread is shallow, so without this,
+          // `scalarsMap` here would be the *same array instance* as the
+          // caller's `opts.buildSchemaOptions.scalarsMap`.
+          // `assignScalarObjects` (in `GraphQLSchemaFactory.create`) pushes
+          // newly-discovered scalar entries onto whatever array it's handed,
+          // so that shared reference would grow the caller's own array by
+          // side effect — measured going from 1 entry to 2 on a caller's
+          // object. Upstream (`GraphQLSchemaBuilder.build`) always builds a
+          // fresh array for the same reason. Harmless in this one-shot child
+          // process, but worth keeping honest.
+          scalarsMap: opts.buildSchemaOptions?.scalarsMap
+            ? [...opts.buildSchemaOptions.scalarsMap]
+            : undefined,
           // Forwarded by `GraphQLSchemaBuilder.build`, and consumed by
           // `TypeDefinitionsGenerator.generate` to filter unions, enums,
           // interfaces, object types and input types by their `registerIn`

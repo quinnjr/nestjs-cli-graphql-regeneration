@@ -23,8 +23,21 @@ function toTreePath(projectRoot: string, outFile: string): string {
   const absolute = path.resolve(projectRoot, outFile);
   const relative = path.relative(projectRoot, absolute);
 
+  if (relative === '') {
+    // Not "outside" the project root — the opposite: `autoSchemaFile`
+    // resolved to the project root directory itself, with nothing left over
+    // to be a filename. Still unwritable, but for a different reason than
+    // the escaping-the-root cases below, so it gets its own message rather
+    // than being lumped in with them.
+    throw new SchematicsException(
+      `The configured schema output path "${outFile}" resolves to "${absolute}" — the ` +
+        `project root itself, not a file inside it. A schematic can only write to a file. ` +
+        `Point "autoSchemaFile" at a path inside the project (e.g. 'src/schema.gql', or ` +
+        `join(process.cwd(), 'src/schema.gql')).`,
+    );
+  }
+
   if (
-    relative === '' ||
     relative === '..' ||
     relative.startsWith(`..${path.sep}`) ||
     path.isAbsolute(relative)

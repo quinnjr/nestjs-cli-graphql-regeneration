@@ -7,9 +7,10 @@ import {
   ObjectType,
   Query,
   Resolver,
+  Scalar,
   type GqlModuleOptions,
 } from '@nestjs/graphql';
-import { GraphQLObjectType, GraphQLSchema, GraphQLString } from 'graphql';
+import { GraphQLObjectType, GraphQLScalarType, GraphQLSchema, GraphQLString } from 'graphql';
 import { mkdtempSync, readFileSync, rmSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import * as path from 'path';
@@ -85,6 +86,36 @@ class Gadget {
   serial!: string;
 }
 
+/**
+ * Target type for the `buildSchemaOptions.scalarsMap` collision case below.
+ * A standalone marker class rather than a real-world type like `Date`, so the
+ * case can't accidentally pass by coincidentally matching some unrelated
+ * built-in scalar mapping.
+ */
+class CustomDateValue {}
+
+/**
+ * A discovered `@Scalar()` provider whose target type (`CustomDateValue`, via
+ * the second decorator argument) collides with the user-supplied
+ * `buildSchemaOptions.scalarsMap` entry declared alongside `userScalarsMap`
+ * below. This is `dedupeAgainstUserScalars`'s reason to exist (see
+ * `src/emitter/build.ts`): if the discovered scalar were appended rather than
+ * dropped, `GraphQLSchemaFactory.create` would put two `GraphQLScalarType`s
+ * both named "CustomDate" into the schema's `types` array, and
+ * `new GraphQLSchema(...)` throws synchronously — "Schema must contain
+ * uniquely named types but contains multiple types named \"CustomDate\"".
+ */
+@Scalar('CustomDate', () => CustomDateValue)
+class CustomDateScalar {
+  serialize(value: unknown): unknown {
+    return value;
+  }
+}
+
+const userScalarsMap = [
+  { type: CustomDateValue, scalar: new GraphQLScalarType({ name: 'CustomDate', serialize: (v) => v }) },
+];
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -148,6 +179,8 @@ interface ParityCase {
   /** The matching `graphql.config` entry the emitter would read. */
   config: Omit<SchemaConfig, 'autoSchemaFile'>;
   extraImports?: any[];
+  /** Defaults to `[RecipesResolver]` (see `appModuleFor`) when omitted. */
+  providers?: any[];
   /** Asserted to be present/absent in the ground-truth SDL, so the case is proven meaningful. */
   bootMustContain?: string[];
   bootMustNotContain?: string[];
@@ -172,6 +205,18 @@ const cases: ParityCase[] = [
     moduleOptions: { buildSchemaOptions: { orphanedTypes: [Ingredient] } },
     config: { buildSchemaOptions: { orphanedTypes: [Ingredient] } },
     bootMustContain: ['type Ingredient'],
+  },
+  {
+    name: 'buildSchemaOptions.scalarsMap colliding with a discovered @Scalar()',
+    fields: ['buildSchemaOptions'],
+    moduleOptions: { buildSchemaOptions: { scalarsMap: userScalarsMap } },
+    config: { buildSchemaOptions: { scalarsMap: userScalarsMap } },
+    providers: [RecipesResolver, CustomDateScalar],
+    // Proves the case is meaningful (the scalar really is emitted) and, more
+    // importantly, that the boot path — which already de-duplicates in
+    // `GraphQLSchemaBuilder.build` — does not choke on the collision, which
+    // is the pre-condition for asserting byte parity against it below.
+    bootMustContain: ['scalar CustomDate'],
   },
   {
     name: 'buildSchemaOptions.addNewlineAtEnd (the level upstream declares it at)',
@@ -235,6 +280,7 @@ describe('SchemaConfig byte parity with the boot path', () => {
     const AppModule = appModuleFor(
       { autoSchemaFile: outFile, ...testCase.moduleOptions },
       testCase.extraImports,
+      testCase.providers,
     );
 
     const bootSdl = await bootAndReadSdl(AppModule, outFile);

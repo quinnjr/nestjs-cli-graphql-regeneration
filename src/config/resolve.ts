@@ -13,9 +13,46 @@ export const APP_MODULE_BASENAME = 'app.module.js';
  * package ended up typing `autoSchemaFile` as `string` when upstream accepts
  * `boolean | string | SchemaFileConfig`, and how `transformAutoSchemaFile`
  * went missing entirely — divergences the compiler could not see because a
- * config loaded through `require()` arrives as `any`. Tying the type to
- * upstream means the *next* option @nestjs/graphql adds shows up as a
- * compile error here rather than as a silent byte difference.
+ * config loaded through `require()` arrives as `any`.
+ *
+ * What tying the type to upstream actually buys: a rename, removal, or type
+ * change of one of the six fields named below (`autoSchemaFile`,
+ * `sortSchema`, `buildSchemaOptions`, `transformSchema`,
+ * `transformAutoSchemaFile`, `include`) is a compile error here, because
+ * `Pick<>` re-derives each named field's type from `GqlModuleOptions` rather
+ * than restating it.
+ *
+ * What it does NOT buy, despite an earlier version of this comment claiming
+ * otherwise: catching the *next option upstream adds*. `Pick<T, K>` only
+ * looks up the keys named in `K` — it does not enumerate `T`'s full key set —
+ * so a brand-new sibling field on `GqlModuleOptions` compiles cleanly whether
+ * or not `SchemaConfig` picks it up. Confirmed with a minimal repro: adding a
+ * field to the source interface leaves both this `Pick` and the
+ * `Record<keyof SchemaConfig, true>` latch below compiling unchanged. If a
+ * future @nestjs/graphql release adds an option that affects the written SDL
+ * — the way `transformAutoSchemaFile` once did before this package tracked it
+ * — nothing here will flag it; that residual risk is closed only by reading
+ * upstream's changelog, not by the type system. (An `Exclude<keyof
+ * GqlModuleOptions, keyof SchemaConfig | ...>` assertion pinned to `never`
+ * was considered to make the original claim true, but `GqlModuleOptions` has
+ * eighteen fields outside this pick — `path`, `typeDefs`, `typePaths`,
+ * `driver`, `directiveResolvers`, `schema`, `resolvers`, `definitions`,
+ * `useGlobalPrefix`, `fieldResolverEnhancers`, `resolverValidationOptions`,
+ * `inheritResolversFromInterfaces`, `transformResolvers`, `context`,
+ * `metadata`, `debug`, `introspection`, `stopOnApplicationShutdown` — and
+ * excluding all of them by name would be a sprawling, unmaintainable list for
+ * a comment's sake, so it was skipped in favor of this honest one.)
+ *
+ * The same gap exists one nesting level down, and it is not hypothetical:
+ * `BuildSchemaOptions` has nine fields, and only three currently have a
+ * byte-parity case in `test/parity-config.spec.ts` — `orphanedTypes`,
+ * `addNewlineAtEnd`, and `scalarsMap`. That nesting level is exactly where
+ * two of this package's real defects lived (`addNewlineAtEnd` read at the
+ * wrong level; a `scalarsMap` entry colliding with a discovered `@Scalar()`
+ * crashing schema construction — see `dedupeAgainstUserScalars` in
+ * `../emitter/build.ts`), so the other six fields (`dateScalarMode`,
+ * `numberScalarMode`, `skipCheck`, `directives`, `fieldMiddleware`,
+ * `noDuplicatedFields`) are an open gap, not a proven-safe area.
  */
 export type SchemaConfig = Pick<
   GqlModuleOptions,

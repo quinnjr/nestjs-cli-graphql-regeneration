@@ -150,13 +150,17 @@ describe('spawnEmitter', () => {
   });
 
   it('does not truncate a large error payload from the child', async () => {
-    // Regression test: process.exit() right after process.stdout.write() does
-    // not wait for the (asynchronous, piped) write to flush, so a large
-    // err.stack — plausible for a deep Nest DI failure — could be cut off.
-    // Confirmed by hand that a 5,000,000-char payload written this way and
-    // immediately followed by process.exit(1) reliably truncates around
-    // ~146KB over a real OS pipe; child.ts now uses process.exitCode instead
-    // and lets the process end naturally once the write drains.
+    // Regression test. An earlier protocol wrote the payload to stdout and
+    // called process.exit() immediately after — process.exit() does not wait
+    // for an asynchronous, piped write to flush, so a large err.stack —
+    // plausible for a deep Nest DI failure — could be cut off. Confirmed by
+    // hand that a 5,000,000-char payload written this way and immediately
+    // followed by process.exit(1) reliably truncates around ~146KB over a
+    // real OS pipe. child.ts now writes the payload with a synchronous,
+    // short-write-tolerant loop (writeSync) to the dedicated descriptor in
+    // ./protocol.ts, and never calls process.exit() itself — the process
+    // ends naturally (via process.exitCode on failure, or the default 0 once
+    // main() resolves), only after that write loop has already completed.
     const dir = tempDir('gqlspawn-large-error-');
     const distRoot = path.join(dir, 'dist');
     mkdirSync(distRoot, { recursive: true });
@@ -222,9 +226,10 @@ describe('spawnEmitter', () => {
   it('surfaces a clear error when the child dies without producing usable output', async () => {
     // Exercises the branch that exists precisely for cases like
     // @nestjs/common's loadPackage calling process.exit(1) directly: some
-    // code reachable from the required app module exits before ever writing
-    // JSON to stdout. A raw process.exit() at require-time reproduces that
-    // shape without needing real Nest internals.
+    // code reachable from the required app module exits before ever calling
+    // writePayload — i.e. before anything reaches the dedicated payload
+    // descriptor in ./protocol.ts. A raw process.exit() at require-time
+    // reproduces that shape without needing real Nest internals.
     const dir = tempDir('gqlspawn-no-output-');
     const distRoot = path.join(dir, 'dist');
     mkdirSync(distRoot, { recursive: true });

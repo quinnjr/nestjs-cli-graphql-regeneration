@@ -10,7 +10,10 @@ export { EmitRequest, EmitSuccess, EmitFailure, PAYLOAD_FD };
 // dist/emitter/child.js right beside it. Under ts-jest, though, this module
 // runs straight from src/emitter/spawn.ts — __dirname is src/emitter, where
 // child.ts has no .js sibling — so also try the compiled output one level up.
-// Mirrors the dual-candidate-path pattern in ../config/resolve.ts.
+// Mirrors the try-each-candidate-path pattern in ../config/dist-layout.ts
+// (findDistFile/resolveDistFile) — a different dual-candidate list (this
+// module's own source-vs-compiled location, not that module's flat-vs-nested
+// dist/ layout), but the same "probe existsSync over an ordered list" shape.
 function resolveChildEntry(): string {
   const candidates = [
     path.join(__dirname, 'child.js'),
